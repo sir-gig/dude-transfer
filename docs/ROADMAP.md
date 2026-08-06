@@ -18,7 +18,8 @@
 - Compact existing small objects.
 - Incrementally transfer only changed partitions.
 - Store durable checkpoints outside ephemeral driver storage.
-- Add a distributed single-object writer for safely concatenable formats.
+- Extend the new S3-side single-object composer with durable manifest storage
+  and executor-produced manifests for safely concatenable formats.
 - Add OpenTelemetry metrics and structured audit events.
 
 ## Harden releases

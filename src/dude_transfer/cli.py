@@ -8,6 +8,7 @@ import sys
 import time
 from typing import Any
 
+from .compose import ComposeConfig, compose_s3_objects, plan_compose
 from .models import TransferEvent
 from .s3 import MultipartConfig, plan_file, send_file
 from .utils import format_size
@@ -34,6 +35,31 @@ def _parser() -> argparse.ArgumentParser:
     )
     send.add_argument("--expected-bucket-owner", help="reject a bucket owned by another account")
     send.add_argument("--sse-kms-key-id", help="encrypt the object with this KMS key")
+
+    inspect_compose = commands.add_parser(
+        "plan-compose",
+        help="inspect an ordered server-side S3 composition without writing",
+    )
+    inspect_compose.add_argument("destination")
+    inspect_compose.add_argument("sources", nargs="+")
+    _add_compose_options(inspect_compose)
+    inspect_compose.add_argument("--json", action="store_true", help="print the plan as JSON")
+
+    compose = commands.add_parser(
+        "compose-s3",
+        help="concatenate ordered S3 objects with server-side multipart copy",
+    )
+    compose.add_argument("destination")
+    compose.add_argument("sources", nargs="+")
+    _add_compose_options(compose)
+    compose.add_argument("--json", action="store_true", help="print the result as JSON")
+    compose.add_argument(
+        "--json-events",
+        action="store_true",
+        help="stream structured transfer events to stderr",
+    )
+    compose.add_argument("--expected-bucket-owner", help="pin the destination AWS account")
+    compose.add_argument("--sse-kms-key-id", help="encrypt the result with this KMS key")
     return parser
 
 
@@ -67,6 +93,40 @@ def _config(args: argparse.Namespace) -> MultipartConfig:
     )
 
 
+def _add_compose_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--copy-part-size", default="512MiB")
+    parser.add_argument("--concurrency", type=int, default=16)
+    parser.add_argument("--initial-concurrency", type=int, default=4)
+    parser.add_argument("--fixed-concurrency", action="store_true")
+    parser.add_argument("--adjustment-window", type=int, default=2)
+    parser.add_argument("--checksum", choices=("CRC32", "SHA256"), default="CRC32")
+    parser.add_argument("--no-resume", action="store_true")
+    parser.add_argument("--checkpoint")
+    parser.add_argument("--verify", action="store_true")
+    parser.add_argument("--expected-source-bucket-owner", help="pin the source AWS account")
+    parser.add_argument(
+        "--request-payer",
+        choices=("requester",),
+        help="acknowledge requester-pays source buckets",
+    )
+
+
+def _compose_config(args: argparse.Namespace) -> ComposeConfig:
+    return ComposeConfig(
+        copy_part_size=args.copy_part_size,
+        max_concurrency=args.concurrency,
+        initial_concurrency=args.initial_concurrency,
+        adaptive=not args.fixed_concurrency,
+        adjustment_window=args.adjustment_window,
+        checksum_algorithm=args.checksum,
+        resume=not args.no_resume,
+        checkpoint_path=args.checkpoint,
+        verify_after_compose=args.verify,
+        expected_source_bucket_owner=getattr(args, "expected_source_bucket_owner", None),
+        request_payer=getattr(args, "request_payer", None),
+    )
+
+
 def _print_plan(plan: Any) -> None:
     print(f"source:       {plan.source}")
     print(f"destination:  {plan.destination}")
@@ -80,11 +140,33 @@ def _print_plan(plan: Any) -> None:
     print(f"peak buffers: {format_size(plan.peak_buffer_bytes)}")
 
 
+def _print_compose_plan(plan: Any) -> None:
+    print(f"destination:  {plan.destination}")
+    print(f"sources:      {len(plan.sources)} ordered objects")
+    print(f"size:         {format_size(plan.size_bytes)}")
+    print(f"copy parts:   {plan.part_count}")
+    if plan.adaptive:
+        print(f"concurrency:  adaptive {plan.initial_concurrency}..{plan.concurrency}")
+    else:
+        print(f"concurrency:  fixed {plan.concurrency}")
+    print("data path:    S3 to S3 (no payload download)")
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    config = _config(args)
     if args.command == "plan-file":
-        _print_plan(plan_file(args.source, args.destination, config=config))
+        _print_plan(plan_file(args.source, args.destination, config=_config(args)))
+        return 0
+    if args.command == "plan-compose":
+        plan = plan_compose(
+            args.sources,
+            args.destination,
+            config=_compose_config(args),
+        )
+        if args.json:
+            print(json.dumps(plan.as_dict(), indent=2, sort_keys=True))
+        else:
+            _print_compose_plan(plan)
         return 0
 
     last_update = 0.0
@@ -116,24 +198,38 @@ def main(argv: list[str] | None = None) -> int:
     create_args = {}
     if args.expected_bucket_owner:
         create_args["ExpectedBucketOwner"] = args.expected_bucket_owner
+    if getattr(args, "request_payer", None):
+        create_args["RequestPayer"] = args.request_payer
     if args.sse_kms_key_id:
         create_args.update(
             ServerSideEncryption="aws:kms",
             SSEKMSKeyId=args.sse_kms_key_id,
         )
 
-    result = send_file(
-        args.source,
-        args.destination,
-        config=config,
-        create_args=create_args,
-        progress=None if args.json or args.json_events else progress,
-        events=event,
-    )
+    if args.command == "send-file":
+        result = send_file(
+            args.source,
+            args.destination,
+            config=_config(args),
+            create_args=create_args,
+            progress=None if args.json or args.json_events else progress,
+            events=event,
+        )
+        action = "sent"
+    else:
+        result = compose_s3_objects(
+            args.sources,
+            args.destination,
+            config=_compose_config(args),
+            create_args=create_args,
+            progress=None if args.json or args.json_events else progress,
+            events=event,
+        )
+        action = "composed"
     if not args.json:
         print(file=sys.stderr)
         print(
-            f"sent {format_size(result.bytes_transferred)} in {result.elapsed_seconds:.2f}s "
+            f"{action} {format_size(result.bytes_transferred)} in {result.elapsed_seconds:.2f}s "
             f"({result.throughput_mib_s:.1f} MiB/s)"
         )
     else:

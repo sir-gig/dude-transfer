@@ -1,6 +1,7 @@
 """Dude's collision-free public transfer API."""
 
 from .api import send
+from .compose import ComposeConfig, compose_s3_objects, plan_compose
 from .dataframe import diagnose_dataframe, plan_dataframe, send_dataframe
 from .exceptions import (
     CheckpointError,
@@ -9,22 +10,35 @@ from .exceptions import (
     SourceChangedError,
     UploadVerificationError,
 )
-from .models import DataFramePlan, Diagnostic, FilePlan, TransferEvent, TransferResult
+from .models import (
+    ComposePlan,
+    ComposeSource,
+    DataFramePlan,
+    Diagnostic,
+    FilePlan,
+    TransferEvent,
+    TransferResult,
+)
 from .s3 import MultipartConfig, plan_file, send_file
 
 __all__ = [
+    "CheckpointError",
+    "ComposeConfig",
+    "ComposePlan",
+    "ComposeSource",
+    "ConfigurationError",
     "DataFramePlan",
     "Diagnostic",
     "DudeError",
-    "CheckpointError",
-    "ConfigurationError",
     "FilePlan",
     "MultipartConfig",
     "SourceChangedError",
     "TransferEvent",
     "TransferResult",
     "UploadVerificationError",
+    "compose_s3_objects",
     "diagnose_dataframe",
+    "plan_compose",
     "plan_dataframe",
     "plan_file",
     "send",

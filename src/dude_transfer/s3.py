@@ -121,6 +121,8 @@ def parse_s3_uri(uri: str) -> tuple[str, str]:
     parsed = urlparse(uri)
     if parsed.scheme != "s3" or not parsed.netloc:
         raise ConfigurationError("destination must be an s3://bucket/key URI")
+    if parsed.params or parsed.query or parsed.fragment:
+        raise ConfigurationError("S3 URIs cannot contain parameters, queries, or fragments")
     key = unquote(parsed.path.lstrip("/"))
     if not key:
         raise ConfigurationError("destination must include an S3 object key")
@@ -133,6 +135,11 @@ def _validated_create_args(create_args: Mapping[str, Any] | None) -> dict[str, A
     if reserved:
         names = ", ".join(reserved)
         raise ConfigurationError(f"create_args cannot override Dude-managed fields: {names}")
+    sse_customer_fields = sorted(name for name in extra if name.startswith("SSECustomer"))
+    if sse_customer_fields:
+        raise ConfigurationError(
+            "SSE-C is not supported; use bucket encryption, AES256, or aws:kms"
+        )
     metadata = extra.get("Metadata", {})
     if not isinstance(metadata, Mapping):
         raise ConfigurationError("create_args Metadata must be a mapping")
@@ -325,9 +332,11 @@ def _creation_args(
 
 
 def _owner_args(create_args: Mapping[str, Any]) -> dict[str, Any]:
-    if "ExpectedBucketOwner" in create_args:
-        return {"ExpectedBucketOwner": create_args["ExpectedBucketOwner"]}
-    return {}
+    return {
+        name: create_args[name]
+        for name in ("ExpectedBucketOwner", "RequestPayer")
+        if name in create_args
+    }
 
 
 def _new_upload(

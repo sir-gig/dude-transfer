@@ -49,6 +49,32 @@ class FilePlan:
 
 
 @dataclass(frozen=True)
+class ComposeSource:
+    uri: str
+    size_bytes: int
+    etag: str
+    version_id: str | None
+    part_count: int
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class ComposePlan:
+    destination: str
+    sources: tuple[ComposeSource, ...]
+    size_bytes: int
+    part_count: int
+    initial_concurrency: int
+    concurrency: int
+    adaptive: bool
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
 class TransferResult:
     kind: str
     destination: str

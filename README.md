@@ -6,7 +6,8 @@
 Dude makes the fast path from Databricks to Amazon S3 the default. It plans
 distributed DataFrame writes, detects serialization bottlenecks, and provides a
 resumable concurrent multipart uploader when the destination must be one S3
-object.
+object. It can also compose ordered staging objects entirely inside S3, so
+payload bytes do not make a wasteful round trip through the Databricks driver.
 
 ## Project status
 
@@ -21,13 +22,15 @@ collision with an unrelated package already using the `dude` import namespace.
 ## Why
 
 A multi-gigabyte transfer should not silently run through one driver thread.
-Dude separates the two workloads that are often accidentally mixed together:
+Dude separates the transfer shapes that are often accidentally mixed together:
 
 - **Spark datasets** are written directly by executors as multiple Parquet,
   Delta, JSON, or CSV objects.
 - **Single files** are split into checksummed S3 multipart uploads with bounded
   memory, adaptive concurrency, retries, durable checkpoints, and independent
   completion verification.
+- **Concatenable S3 chunks** are assembled with concurrent server-side multipart
+  copies, source-version pinning, resume, and no payload download to the driver.
 
 ## Install on Databricks
 
@@ -118,6 +121,53 @@ change can also be consumed as a structured `TransferEvent`.
 length and Dude's random transfer identity. It requires `s3:GetObject` in
 addition to the write permissions required by multipart upload.
 
+## Compose staged S3 chunks without downloading them
+
+If executors have already produced ordered chunks of a byte-concatenable format,
+Dude can make one S3 object without downloading and re-uploading those bytes:
+
+```python
+from dude_transfer import ComposeConfig, compose_s3_objects
+
+result = compose_s3_objects(
+    [
+        "s3://my-lab-data/stage/run-42/0000.jsonl",
+        "s3://my-lab-data/stage/run-42/0001.jsonl",
+        "s3://my-lab-data/stage/run-42/0002.jsonl",
+    ],
+    "s3://my-lab-data/final/run-42.jsonl",
+    config=ComposeConfig(
+        copy_part_size="512MiB",
+        initial_concurrency=4,
+        max_concurrency=16,
+        resume=True,
+        verify_after_compose=True,
+        expected_source_bucket_owner="123456789012",
+    ),
+    create_args={
+        "ExpectedBucketOwner": "123456789012",
+        "ServerSideEncryption": "aws:kms",
+        "SSEKMSKeyId": "alias/lab-data",
+    },
+)
+```
+
+The source order is the byte order in the destination. Dude inspects every
+source, pins its ETag and version ID when available, splits large sources into
+legal copy ranges, and rejects a plan if any nonfinal output part would be under
+S3's 5 MiB minimum. Sources are never modified or deleted.
+
+This is correct for JSON Lines, text, and binary streams that were deliberately
+split on safe boundaries. It does **not** turn independent Parquet files into one
+valid Parquet file; keep those as a Spark dataset. Likewise, format-level headers,
+trailers, delimiters, and compression semantics remain the caller's responsibility.
+
+The runtime role needs `s3:GetObject` on sources plus the destination multipart
+permissions (`s3:PutObject`, `s3:ListMultipartUploadParts`, and
+`s3:AbortMultipartUpload`). KMS-encrypted sources and destinations also require
+the corresponding KMS permissions. Configure an S3 lifecycle rule to expire
+abandoned multipart uploads as a final safety net.
+
 ### CLI
 
 ```bash
@@ -125,15 +175,21 @@ dude plan-file /local_disk0/diagnostics.bin s3://bucket/diagnostics.bin
 dude send-file /local_disk0/diagnostics.bin s3://bucket/diagnostics.bin \
   --part-size 64MiB --initial-concurrency 2 --concurrency 8 \
   --max-memory 512MiB --verify --json-events
+dude plan-compose s3://bucket/final/run.jsonl \
+  s3://bucket/stage/0000.jsonl s3://bucket/stage/0001.jsonl
+dude compose-s3 s3://bucket/final/run.jsonl \
+  s3://bucket/stage/0000.jsonl s3://bucket/stage/0001.jsonl \
+  --initial-concurrency 4 --concurrency 16 --verify --json-events
 ```
 
 ## Current scope
 
-Version 0.1 deliberately focuses on the two critical paths. Its first adaptive
+Version 0.1 deliberately focuses on three critical paths. Its first adaptive
 controller reacts to measured part throughput and retries, but does not yet use
-cluster CPU, NIC, or S3 request metrics. It also does not calculate exact
-DataFrame output sizes, compact existing S3 small files, or distribute parts of
-a single byte stream across Spark executors.
+cluster CPU, NIC, or S3 request metrics. It does not calculate exact DataFrame
+output sizes, compact arbitrary existing S3 small files, or distribute ranges of
+one local file across Spark executors. Server-side composition requires sources
+that are already ordered and byte-concatenable.
 
 ## Contributing and security
 
