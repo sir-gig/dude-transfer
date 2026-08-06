@@ -1,0 +1,85 @@
+name: Live S3 contract
+
+on:
+  workflow_dispatch:
+    inputs:
+      bucket:
+        description: Disposable bucket containing no production data
+        required: true
+        type: string
+      prefix:
+        description: dude-integration or an owned child prefix
+        required: true
+        default: dude-integration
+        type: string
+      aws_region:
+        description: AWS region containing the bucket
+        required: true
+        default: us-east-1
+        type: string
+      expected_bucket_owner:
+        description: Twelve-digit AWS account ID that owns the bucket
+        required: true
+        type: string
+      confirm_synthetic:
+        description: Confirm the bucket and prefix contain no production data
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: live-s3-contract
+  cancel-in-progress: false
+
+jobs:
+  live-s3:
+    environment: live-s3-integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Validate scope and generate least-privilege session policy
+        id: scope
+        env:
+          DUDE_BUCKET: ${{ inputs.bucket }}
+          DUDE_PREFIX: ${{ inputs.prefix }}
+          DUDE_AWS_REGION: ${{ inputs.aws_region }}
+          DUDE_EXPECTED_BUCKET_OWNER: ${{ inputs.expected_bucket_owner }}
+          DUDE_CONFIRM_SYNTHETIC: ${{ inputs.confirm_synthetic }}
+          DUDE_AWS_ROLE_ARN: ${{ vars.DUDE_AWS_ROLE_ARN }}
+        run: >-
+          python scripts/live_integration_policy.py
+          --bucket "$DUDE_BUCKET"
+          --prefix "$DUDE_PREFIX"
+          --region "$DUDE_AWS_REGION"
+          --expected-account "$DUDE_EXPECTED_BUCKET_OWNER"
+          --role-arn "$DUDE_AWS_ROLE_ARN"
+          --confirm-synthetic "$DUDE_CONFIRM_SYNTHETIC"
+          --github-output "$GITHUB_OUTPUT"
+      - name: Assume short-lived integration role
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: ${{ vars.DUDE_AWS_ROLE_ARN }}
+          aws-region: ${{ inputs.aws_region }}
+          allowed-account-ids: ${{ inputs.expected_bucket_owner }}
+          role-session-name: dude-live-${{ github.run_id }}
+          inline-session-policy: ${{ steps.scope.outputs.policy }}
+          mask-aws-account-id: true
+          unset-current-credentials: true
+      - run: python -m pip install -e ".[dev]"
+      - name: Run exact-prefix live contract
+        env:
+          DUDE_INTEGRATION_BUCKET: ${{ inputs.bucket }}
+          DUDE_INTEGRATION_PREFIX: ${{ inputs.prefix }}
+          DUDE_EXPECTED_BUCKET_OWNER: ${{ inputs.expected_bucket_owner }}
+        run: python -m pytest -m integration -vv

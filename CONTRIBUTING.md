@@ -28,6 +28,11 @@ run this test against a production-data prefix.
 Versioned buckets may retain prior object versions or delete markers according
 to their own lifecycle policy.
 
+Maintainers can run the same contract without stored AWS keys through the manual
+`Live S3 contract` GitHub workflow. Its OIDC trust, protected environment, and
+least-privilege session-policy setup are documented in
+[`docs/LIVE_S3_INTEGRATION.md`](docs/LIVE_S3_INTEGRATION.md).
+
 ## Pull requests
 
 1. Open an issue before beginning a large behavioral or API change.

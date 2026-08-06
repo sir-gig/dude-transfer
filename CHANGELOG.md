@@ -35,6 +35,8 @@ All notable changes will be documented here.
   Spark reshuffles without downloading payload bytes to the driver.
 - Per-attempt staging manifests, skew decisions, structured events, and aggregate
   cleanup results for repaired exports.
+- A manual, protected-environment live S3 workflow using GitHub OIDC and a
+  generated exact-prefix session policy instead of stored AWS access keys.
 
 ### Changed
 
@@ -47,6 +49,7 @@ All notable changes will be documented here.
   SSE-C settings fail before an upload begins.
 - `maxRecordsPerFile` is rejected for single-object DataFrame writes because it
   can recreate illegal undersized chunks after partition repair.
+- Pull requests no longer launch a duplicate CI matrix from their branch push.
 
 ### Fixed
 

@@ -43,3 +43,8 @@ download before installation with:
 ```bash
 gh attestation verify dude_transfer-*.whl --repo sir-gig/dude-transfer
 ```
+
+The opt-in live AWS workflow uses GitHub OIDC and a short-lived role session. It
+does not read static AWS access-key secrets, pins the expected AWS account, and
+adds a generated inline session policy restricted to the selected synthetic-test
+prefix.
