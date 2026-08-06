@@ -36,8 +36,10 @@ Dude is alpha software and has not received an independent security audit.
 
 ## Release provenance
 
-GitHub Actions dependencies are pinned to full commit hashes. Tagged release
-artifacts receive a Sigstore-backed GitHub build-provenance attestation. Verify a
+GitHub Actions dependencies are pinned to full commit hashes. Release builds run
+without OIDC permission; isolated jobs attest the resulting files and publish to
+PyPI through short-lived Trusted Publishing credentials. Tagged artifacts receive
+GitHub/Sigstore provenance, and PyPI publishes PEP 740 attestations. Verify a
 download before installation with:
 
 ```bash

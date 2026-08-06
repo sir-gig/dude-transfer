@@ -19,7 +19,8 @@ and workload details in [`benchmarks/`](benchmarks/).
 The command remains `dude`; the Python import is `dude_transfer` to avoid a
 collision with an unrelated package already using the `dude` import namespace.
 Release artifacts are generated only from version tags and receive GitHub/Sigstore
-build-provenance attestations before they are attached to a GitHub release.
+build-provenance attestations before PyPI Trusted Publishing and attachment to a
+GitHub release. The maintainer checklist is in [`docs/RELEASING.md`](docs/RELEASING.md).
 
 ## Why
 
