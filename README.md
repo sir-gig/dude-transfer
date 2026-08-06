@@ -112,8 +112,8 @@ Spark DataFrames have no implicit global row order. Dude preserves Spark's
 partition/chunk order but does not invent a row-order guarantee. Each nonfinal
 payload object must meet S3's 5 MiB multipart minimum; if skew creates a smaller
 object, Dude fails closed and retains the staging run. `mode="errorifexists"`
-performs a destination preflight check, but S3 clients without conditional
-multipart completion cannot make that check atomic against another writer.
+uses S3's atomic `If-None-Match: *` condition at object commit, so concurrent
+writers cannot silently replace the destination.
 
 ## Send one file
 
@@ -132,6 +132,7 @@ result = send_file(
         checksum_algorithm="CRC32",
         resume=True,
         verify_after_upload=True,
+        if_none_match=True,
     ),
     create_args={
         "ServerSideEncryption": "aws:kms",
@@ -151,6 +152,11 @@ Adaptive uploads start with two connections, probe upward while aggregate
 throughput improves, and back off when requests require retries. The configured
 memory ceiling remains authoritative. Every part completion and concurrency
 change can also be consumed as a structured `TransferEvent`.
+
+Set `if_none_match=True` for atomic create-only writes, or `if_match='"etag"'`
+for compare-and-swap replacement. Dude sends the condition on `PutObject` or the
+final `CompleteMultipartUpload`, where S3 evaluates it atomically. The two
+conditions are mutually exclusive.
 
 `verify_after_upload=True` performs a `HeadObject` check against the exact byte
 length and Dude's random transfer identity. It requires `s3:GetObject` in
@@ -178,6 +184,7 @@ result = compose_s3_objects(
         resume=True,
         verify_after_compose=True,
         expected_source_bucket_owner="123456789012",
+        if_none_match=True,
     ),
     create_args={
         "ExpectedBucketOwner": "123456789012",
@@ -223,7 +230,7 @@ dude plan-compose s3://bucket/final/run.jsonl \
   s3://bucket/stage/0000.jsonl s3://bucket/stage/0001.jsonl
 dude compose-s3 s3://bucket/final/run.jsonl \
   s3://bucket/stage/0000.jsonl s3://bucket/stage/0001.jsonl \
-  --initial-concurrency 4 --concurrency 16 --verify --json-events
+  --initial-concurrency 4 --concurrency 16 --if-none-match --verify --json-events
 ```
 
 ## Current scope

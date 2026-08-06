@@ -25,9 +25,12 @@ from .s3 import (
     _abort_upload,
     _call_with_retry,
     _completion_part,
+    _conditional_write_args,
     _creation_args,
+    _discard_upload,
     _error_code,
     _get_client,
+    _http_status,
     _object_matches,
     _owner_args,
     _read_checkpoint,
@@ -54,6 +57,8 @@ class ComposeConfig:
     verify_after_compose: bool = False
     expected_source_bucket_owner: str | None = None
     request_payer: str | None = None
+    if_none_match: bool = False
+    if_match: str | None = None
 
 
 @dataclass(frozen=True)
@@ -89,6 +94,7 @@ def _effective_config(config: ComposeConfig) -> ComposeConfig:
         raise ConfigurationError("compose checksum_algorithm must be CRC32 or SHA256")
     if config.request_payer not in {None, "requester"}:
         raise ConfigurationError("request_payer must be 'requester' or None")
+    _conditional_write_args(config.if_none_match, config.if_match)
     return ComposeConfig(
         copy_part_size=part_size,
         max_concurrency=config.max_concurrency,
@@ -102,6 +108,8 @@ def _effective_config(config: ComposeConfig) -> ComposeConfig:
         verify_after_compose=config.verify_after_compose,
         expected_source_bucket_owner=config.expected_source_bucket_owner,
         request_payer=config.request_payer,
+        if_none_match=config.if_none_match,
+        if_match=config.if_match,
     )
 
 
@@ -279,6 +287,10 @@ def _identity(
         "sources": [source.as_dict() for source in plan.sources],
         "copy_part_size": config.copy_part_size,
         "checksum_algorithm": config.checksum_algorithm,
+        "conditional_args": _conditional_write_args(
+            config.if_none_match,
+            config.if_match,
+        ),
         "create_args": dict(create_args),
     }
     canonical = json.dumps(manifest, sort_keys=True, default=str).encode("utf-8")
@@ -339,6 +351,7 @@ def compose_s3_objects(
     plan, copy_parts = _inspect_and_plan(sources, destination, s3, cfg)
     destination_bucket, destination_key = parse_s3_uri(destination)
     destination_requests = _owner_args(extra)
+    conditional = _conditional_write_args(cfg.if_none_match, cfg.if_match)
     identity = _identity(plan, cfg, extra)
     checkpoint = _checkpoint_path(identity, cfg)
     started = time.monotonic()
@@ -399,6 +412,54 @@ def compose_s3_objects(
             except Exception as error:
                 if _error_code(error) not in {"NoSuchUpload", "404"}:
                     raise
+                if _object_matches(
+                    s3,
+                    destination_bucket,
+                    destination_key,
+                    plan.size_bytes,
+                    transfer_id,
+                    destination_requests,
+                    cfg.max_attempts,
+                ):
+                    checkpoint.unlink(missing_ok=True)
+                    if progress:
+                        progress(plan.size_bytes, plan.size_bytes)
+                    elapsed = time.monotonic() - started
+                    emit(
+                        "resumed",
+                        plan.size_bytes,
+                        detail="recovered a commit completed before restart",
+                    )
+                    emit("completed", plan.size_bytes, concurrency=0)
+                    return TransferResult(
+                        kind="compose",
+                        destination=destination,
+                        elapsed_seconds=elapsed,
+                        bytes_transferred=plan.size_bytes,
+                        throughput_mib_s=None,
+                        parts=plan.part_count,
+                        resumed=True,
+                        metadata={
+                            "plan": asdict(plan),
+                            "checksum": cfg.checksum_algorithm,
+                            "retries": 0,
+                            "reused_parts": 0,
+                            "verified": True,
+                            "completion_recovered": True,
+                            "recovery_phase": "restart",
+                            "transfer_id": transfer_id,
+                            "destination_condition": conditional or None,
+                            "payload_bytes_downloaded_by_client": 0,
+                            "sources_preserved": True,
+                            "adaptive": {
+                                "enabled": False,
+                                "initial_concurrency": 0,
+                                "final_concurrency": 0,
+                                "peak_concurrency": 0,
+                                "changes": [],
+                            },
+                        },
+                    )
                 upload_id = None
                 transfer_id = None
                 completed = {}
@@ -565,12 +626,13 @@ def compose_s3_objects(
                 UploadId=upload_id,
                 MultipartUpload={"Parts": ordered},
                 **destination_requests,
+                **conditional,
             )
 
         try:
             _call_with_retry(complete, cfg.max_attempts)
             committed = True
-        except Exception:
+        except Exception as error:
             completion_recovered = _object_matches(
                 s3,
                 destination_bucket,
@@ -581,6 +643,24 @@ def compose_s3_objects(
                 cfg.max_attempts,
             )
             if not completion_recovered:
+                if conditional and (
+                    _http_status(error) in {404, 409, 412}
+                    or _error_code(error)
+                    in {
+                        "ConditionalRequestConflict",
+                        "NoSuchKey",
+                        "NoSuchUpload",
+                        "PreconditionFailed",
+                    }
+                ):
+                    _discard_upload(
+                        s3,
+                        destination_bucket,
+                        destination_key,
+                        upload_id,
+                        destination_requests,
+                        checkpoint,
+                    )
                 raise
             committed = True
 
@@ -631,6 +711,7 @@ def compose_s3_objects(
             "verified": cfg.verify_after_compose,
             "completion_recovered": completion_recovered,
             "transfer_id": transfer_id,
+            "destination_condition": conditional or None,
             "payload_bytes_downloaded_by_client": 0,
             "sources_preserved": True,
             "adaptive": {

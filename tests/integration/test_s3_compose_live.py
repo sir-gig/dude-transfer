@@ -47,6 +47,7 @@ def test_live_server_side_composition_matches_ordered_bytes(tmp_path):
                 checkpoint_path=tmp_path / "compose.json",
                 verify_after_compose=True,
                 expected_source_bucket_owner=expected_owner,
+                if_none_match=True,
             ),
             create_args=create_args,
         )

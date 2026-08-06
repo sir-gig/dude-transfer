@@ -25,7 +25,11 @@ def test_generated_multipart_requests_match_botocore_models(tmp_path):
         source,
         "s3://bucket/key",
         client=client,
-        config=MultipartConfig(multipart_threshold=1, part_size="5MiB"),
+        config=MultipartConfig(
+            multipart_threshold=1,
+            part_size="5MiB",
+            if_none_match=True,
+        ),
         create_args={
             "ExpectedBucketOwner": "123456789012",
             "ServerSideEncryption": "aws:kms",

@@ -14,6 +14,8 @@ def test_cli_builds_adaptive_verified_config():
             "--adjustment-window",
             "4",
             "--verify",
+            "--if-match",
+            '"current-etag"',
         ]
     )
     config = _config(args)
@@ -21,6 +23,7 @@ def test_cli_builds_adaptive_verified_config():
     assert config.max_concurrency == 12
     assert config.adjustment_window == 4
     assert config.verify_after_upload is True
+    assert config.if_match == '"current-etag"'
 
 
 def test_plan_file_cli_reports_adaptive_range(tmp_path, capsys):
@@ -65,6 +68,7 @@ def test_cli_builds_server_side_compose_config():
             "123456789012",
             "--request-payer",
             "requester",
+            "--if-none-match",
         ]
     )
     config = _compose_config(args)
@@ -74,3 +78,4 @@ def test_cli_builds_server_side_compose_config():
     assert config.max_concurrency == 12
     assert config.expected_source_bucket_owner == "123456789012"
     assert config.request_payer == "requester"
+    assert config.if_none_match is True

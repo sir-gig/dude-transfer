@@ -27,7 +27,9 @@ remain private until maintainers coordinate disclosure.
 - The high-level DataFrame single-object API may clean up staging objects it
   created under a random run-specific prefix. Cleanup occurs only after destination
   verification, refuses keys outside that exact prefix, and can be disabled.
-- `errorifexists` uses a preflight `HeadObject`; with SDKs that lack conditional
-  multipart completion it is not an atomic lock against another concurrent writer.
+- `errorifexists` performs an early `HeadObject` check and enforces
+  `If-None-Match: *` on the final S3 write, preventing concurrent overwrite races.
+- Local-file and direct-composition callers can select the same atomic create-only
+  condition or use `if_match` for an ETag-guarded compare-and-swap replacement.
 
 Dude is alpha software and has not received an independent security audit.

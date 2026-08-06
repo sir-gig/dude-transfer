@@ -146,6 +146,7 @@ def test_dataframe_jsonl_stages_in_parallel_and_composes_in_numeric_order(tmp_pa
     assert result.bytes_transferred == 14 * MIB
     assert result.metadata["payload_bytes_downloaded_by_client"] == 0
     assert result.metadata["global_row_order_guaranteed"] is False
+    assert client.completed["IfNoneMatch"] == "*"
     assert [
         key.rsplit("/", 1)[-1]
         for key in [
@@ -239,6 +240,7 @@ def test_empty_dataframe_creates_verified_empty_object_and_cleans_stage(tmp_path
     )
     assert result.bytes_transferred == 0
     assert client.put_args["Body"] == b""
+    assert client.put_args["IfNoneMatch"] == "*"
     assert result.metadata["composition"] is None
     assert result.metadata["staging_cleanup"]["deleted_objects"] == 2
     assert not client.stage_objects
@@ -260,6 +262,19 @@ def test_existing_destination_fails_before_spark_write(tmp_path):
             compose_config=ComposeConfig(checkpoint_path=tmp_path / "compose.json"),
         )
     assert not any(call[0] == "save" for call in df.write.calls)
+
+
+def test_overwrite_mode_does_not_add_create_only_condition(tmp_path):
+    client = SingleObjectS3()
+    df = dataframe_with_outputs(client, [("part-00000-run-c000.json", 6 * MIB)])
+    send_dataframe_as_single_object(
+        df,
+        "s3://destination/final/run.jsonl",
+        mode="overwrite",
+        client=client,
+        compose_config=ComposeConfig(checkpoint_path=tmp_path / "compose.json"),
+    )
+    assert "IfNoneMatch" not in client.completed
 
 
 def test_stage_discovery_paginates_then_sorts_numeric_partition_ids():

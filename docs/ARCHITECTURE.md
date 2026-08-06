@@ -73,6 +73,8 @@ Each newly created object carries a random `dude-transfer-id` metadata value.
 That identity lets Dude distinguish a successfully committed object from an old
 same-sized object if the completion response is lost. Remote parts are reusable
 only when their byte length and configured checksum metadata match the plan.
+Create-only and compare-and-swap modes are enforced on the final S3 write with
+`If-None-Match` or `If-Match`; a preflight read is never treated as a lock.
 
 ## Trust boundaries
 

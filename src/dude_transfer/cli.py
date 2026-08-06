@@ -75,6 +75,13 @@ def _add_transfer_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-resume", action="store_true")
     parser.add_argument("--checkpoint")
     parser.add_argument("--verify", action="store_true")
+    condition = parser.add_mutually_exclusive_group()
+    condition.add_argument(
+        "--if-none-match",
+        action="store_true",
+        help="commit only if the destination key does not exist",
+    )
+    condition.add_argument("--if-match", help="commit only if the destination ETag matches")
 
 
 def _config(args: argparse.Namespace) -> MultipartConfig:
@@ -90,6 +97,8 @@ def _config(args: argparse.Namespace) -> MultipartConfig:
         resume=not args.no_resume,
         checkpoint_path=args.checkpoint,
         verify_after_upload=args.verify,
+        if_none_match=args.if_none_match,
+        if_match=args.if_match,
     )
 
 
@@ -103,6 +112,13 @@ def _add_compose_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-resume", action="store_true")
     parser.add_argument("--checkpoint")
     parser.add_argument("--verify", action="store_true")
+    condition = parser.add_mutually_exclusive_group()
+    condition.add_argument(
+        "--if-none-match",
+        action="store_true",
+        help="commit only if the destination key does not exist",
+    )
+    condition.add_argument("--if-match", help="commit only if the destination ETag matches")
     parser.add_argument("--expected-source-bucket-owner", help="pin the source AWS account")
     parser.add_argument(
         "--request-payer",
@@ -124,6 +140,8 @@ def _compose_config(args: argparse.Namespace) -> ComposeConfig:
         verify_after_compose=args.verify,
         expected_source_bucket_owner=getattr(args, "expected_source_bucket_owner", None),
         request_payer=getattr(args, "request_payer", None),
+        if_none_match=args.if_none_match,
+        if_match=args.if_match,
     )
 
 

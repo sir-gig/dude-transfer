@@ -16,6 +16,7 @@ from .exceptions import ConfigurationError
 from .models import TransferEvent, TransferResult
 from .s3 import (
     _call_with_retry,
+    _conditional_write_args,
     _creation_args,
     _error_code,
     _get_client,
@@ -188,6 +189,9 @@ def _write_empty_object(
             create_args,
             transfer_id,
         )
+        arguments.update(
+            _conditional_write_args(config.if_none_match, config.if_match)
+        )
         arguments["Body"] = b""
         return client.put_object(**arguments)
 
@@ -270,6 +274,12 @@ def send_dataframe_as_single_object(
         output_options["encoding"] = "UTF-8"
 
     cfg = _effective_config(compose_config or ComposeConfig())
+    normalized_mode = mode.lower()
+    if normalized_mode in {"error", "errorifexists"}:
+        if cfg.if_match is not None:
+            raise ConfigurationError("errorifexists cannot be combined with if_match")
+        if not cfg.if_none_match:
+            cfg = replace(cfg, if_none_match=True)
     if cleanup_staging and not cfg.verify_after_compose:
         cfg = replace(cfg, verify_after_compose=True)
     extra = _validated_create_args(create_args)

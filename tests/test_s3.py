@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pytest
@@ -77,6 +78,12 @@ class CompletionLostS3(FakeS3):
         raise RuntimeError("response lost")
 
 
+class PutResponseLostS3(FakeS3):
+    def put_object(self, **kwargs):
+        super().put_object(**kwargs)
+        raise RuntimeError("put response lost")
+
+
 class MutatingS3(FakeS3):
     def __init__(self, source):
         super().__init__()
@@ -97,6 +104,48 @@ class AccessDeniedError(Exception):
         "Error": {"Code": "AccessDenied"},
         "ResponseMetadata": {"HTTPStatusCode": 403},
     }
+
+
+class PreconditionFailedError(Exception):
+    response = {
+        "Error": {"Code": "PreconditionFailed"},
+        "ResponseMetadata": {"HTTPStatusCode": 412},
+    }
+
+
+class NoSuchUploadError(Exception):
+    response = {
+        "Error": {"Code": "NoSuchUpload"},
+        "ResponseMetadata": {"HTTPStatusCode": 404},
+    }
+
+
+class DestinationPreconditionS3(FakeS3):
+    def __init__(self):
+        super().__init__()
+        self.complete_attempts = 0
+        self.object_size = 1
+        self.object_metadata = {}
+
+    def complete_multipart_upload(self, **kwargs):
+        self.complete_attempts += 1
+        raise PreconditionFailedError("destination exists")
+
+
+class CrashAfterCommitS3(FakeS3):
+    def __init__(self):
+        super().__init__()
+        self.upload_gone = False
+
+    def list_parts(self, **kwargs):
+        if self.upload_gone:
+            raise NoSuchUploadError("upload committed")
+        return super().list_parts(**kwargs)
+
+    def complete_multipart_upload(self, **kwargs):
+        super().complete_multipart_upload(**kwargs)
+        self.upload_gone = True
+        raise SystemExit("simulated process death after commit")
 
 
 class AccessDeniedS3(FakeS3):
@@ -165,9 +214,44 @@ def test_small_upload_uses_put_object(tmp_path):
     source = tmp_path / "small.txt"
     source.write_text("hello", encoding="utf-8")
     client = FakeS3()
-    result = send_file(source, "s3://bucket/key", client=client)
+    result = send_file(
+        source,
+        "s3://bucket/key",
+        client=client,
+        config=MultipartConfig(if_none_match=True),
+    )
     assert result.parts == 1
     assert client.put["Bucket"] == "bucket"
+    assert client.put["IfNoneMatch"] == "*"
+    assert result.metadata["destination_condition"] == {"IfNoneMatch": "*"}
+
+
+def test_small_put_response_loss_is_recovered_by_transfer_identity(tmp_path):
+    source = tmp_path / "small.txt"
+    source.write_text("hello", encoding="utf-8")
+    result = send_file(
+        source,
+        "s3://bucket/key",
+        client=PutResponseLostS3(),
+        config=MultipartConfig(if_none_match=True, max_attempts=1),
+    )
+    assert result.metadata["completion_recovered"] is True
+
+
+def test_small_put_supports_etag_compare_and_swap(tmp_path):
+    source = tmp_path / "small.txt"
+    source.write_text("replacement", encoding="utf-8")
+    client = FakeS3()
+    result = send_file(
+        source,
+        "s3://bucket/key",
+        client=client,
+        config=MultipartConfig(if_match='"current-etag"'),
+    )
+    assert client.put["IfMatch"] == '"current-etag"'
+    assert result.metadata["destination_condition"] == {
+        "IfMatch": '"current-etag"'
+    }
 
 
 def test_non_resumable_failure_aborts_remote_upload(tmp_path):
@@ -235,6 +319,25 @@ def test_corrupt_checkpoint_is_not_silently_discarded(tmp_path):
         send_file(source, "s3://bucket/key", config=config, client=FakeS3())
 
 
+def test_matching_checkpoint_missing_transfer_identity_fails_closed(tmp_path):
+    source = make_sparse_file(tmp_path / "large.bin", 11 * 1024**2)
+    checkpoint = tmp_path / "checkpoint.json"
+    config = MultipartConfig(
+        multipart_threshold=1,
+        part_size="5MiB",
+        checkpoint_path=checkpoint,
+        max_attempts=1,
+    )
+    client = FailingOnceS3()
+    with pytest.raises(RuntimeError):
+        send_file(source, "s3://bucket/key", config=config, client=client)
+    state = json.loads(checkpoint.read_text(encoding="utf-8"))
+    state.pop("transfer_id")
+    checkpoint.write_text(json.dumps(state), encoding="utf-8")
+    with pytest.raises(CheckpointError, match="missing its upload identity"):
+        send_file(source, "s3://bucket/key", config=config, client=client)
+
+
 def test_completion_response_loss_is_recovered_by_transfer_identity(tmp_path):
     source = make_sparse_file(tmp_path / "large.bin", 6 * 1024**2)
     config = MultipartConfig(
@@ -242,10 +345,68 @@ def test_completion_response_loss_is_recovered_by_transfer_identity(tmp_path):
         part_size="5MiB",
         max_attempts=1,
         verify_after_upload=True,
+        if_none_match=True,
     )
     result = send_file(source, "s3://bucket/key", config=config, client=CompletionLostS3())
     assert result.metadata["completion_recovered"] is True
     assert result.metadata["verified"] is True
+
+
+def test_multipart_destination_precondition_discards_unusable_upload(tmp_path):
+    source = make_sparse_file(tmp_path / "large.bin", 6 * 1024**2)
+    checkpoint = tmp_path / "checkpoint.json"
+    client = DestinationPreconditionS3()
+    with pytest.raises(PreconditionFailedError, match="destination exists"):
+        send_file(
+            source,
+            "s3://bucket/key",
+            client=client,
+            config=MultipartConfig(
+                multipart_threshold=1,
+                part_size="5MiB",
+                if_none_match=True,
+                max_attempts=4,
+                checkpoint_path=checkpoint,
+            ),
+        )
+    assert client.complete_attempts == 1
+    assert client.aborted["UploadId"] == "upload-1"
+    assert not checkpoint.exists()
+
+
+def test_restart_recovers_multipart_committed_before_checkpoint_cleanup(tmp_path):
+    source = make_sparse_file(tmp_path / "large.bin", 6 * 1024**2)
+    checkpoint = tmp_path / "checkpoint.json"
+    client = CrashAfterCommitS3()
+    config = MultipartConfig(
+        multipart_threshold=1,
+        part_size="5MiB",
+        if_none_match=True,
+        max_attempts=1,
+        checkpoint_path=checkpoint,
+    )
+    with pytest.raises(SystemExit, match="process death"):
+        send_file(source, "s3://bucket/key", client=client, config=config)
+    assert checkpoint.exists()
+
+    result = send_file(source, "s3://bucket/key", client=client, config=config)
+    assert result.resumed is True
+    assert result.metadata["completion_recovered"] is True
+    assert result.metadata["recovery_phase"] == "restart"
+    assert result.throughput_mib_s is None
+    assert not checkpoint.exists()
+
+
+def test_destination_conditions_are_mutually_exclusive(tmp_path):
+    source = tmp_path / "small.txt"
+    source.write_text("hello", encoding="utf-8")
+    with pytest.raises(ConfigurationError, match="mutually exclusive"):
+        send_file(
+            source,
+            "s3://bucket/key",
+            client=FakeS3(),
+            config=MultipartConfig(if_none_match=True, if_match='"etag"'),
+        )
 
 
 def test_source_mutation_aborts_uncommitted_upload(tmp_path):

@@ -72,6 +72,8 @@ class MultipartConfig:
     checkpoint_path: str | os.PathLike[str] | None = None
     max_attempts: int = 4
     verify_after_upload: bool = False
+    if_none_match: bool = False
+    if_match: str | None = None
 
 
 @dataclass(frozen=True)
@@ -101,6 +103,7 @@ def _effective_config(config: MultipartConfig) -> MultipartConfig:
     checksum = config.checksum_algorithm.upper() if config.checksum_algorithm else None
     if checksum not in {None, "CRC32", "SHA256"}:
         raise ConfigurationError("checksum_algorithm must be CRC32, SHA256, or None")
+    _conditional_write_args(config.if_none_match, config.if_match)
     return MultipartConfig(
         multipart_threshold=threshold,
         part_size=part_size,
@@ -114,7 +117,26 @@ def _effective_config(config: MultipartConfig) -> MultipartConfig:
         checkpoint_path=config.checkpoint_path,
         max_attempts=config.max_attempts,
         verify_after_upload=config.verify_after_upload,
+        if_none_match=config.if_none_match,
+        if_match=config.if_match,
     )
+
+
+def _conditional_write_args(
+    if_none_match: bool,
+    if_match: str | None,
+) -> dict[str, str]:
+    if not isinstance(if_none_match, bool):
+        raise ConfigurationError("if_none_match must be a boolean")
+    if if_none_match and if_match is not None:
+        raise ConfigurationError("if_none_match and if_match are mutually exclusive")
+    if if_match is not None and not str(if_match).strip():
+        raise ConfigurationError("if_match cannot be empty")
+    if if_none_match:
+        return {"IfNoneMatch": "*"}
+    if if_match is not None:
+        return {"IfMatch": str(if_match)}
+    return {}
 
 
 def parse_s3_uri(uri: str) -> tuple[str, str]:
@@ -237,10 +259,15 @@ def _file_identity(
     part_size: int,
     checksum: str | None,
     create_args: Mapping[str, Any],
+    conditional_args: Mapping[str, Any],
 ) -> dict[str, Any]:
     stat = path.stat()
     settings = json.dumps(
-        {"checksum": checksum, "create_args": dict(create_args)},
+        {
+            "checksum": checksum,
+            "create_args": dict(create_args),
+            "conditional_args": dict(conditional_args),
+        },
         sort_keys=True,
         default=str,
     ).encode("utf-8")
@@ -432,9 +459,11 @@ def _put_small_file(
     create_args: Mapping[str, Any],
     transfer_id: str,
     max_attempts: int,
+    conditional_args: Mapping[str, Any],
 ) -> int:
     def operation() -> dict[str, Any]:
         arguments = _creation_args(bucket, key, checksum, create_args, transfer_id)
+        arguments.update(conditional_args)
         with path.open("rb") as stream:
             arguments["Body"] = stream
             return client.put_object(**arguments)
@@ -505,6 +534,23 @@ def _abort_upload(
     )
 
 
+def _discard_upload(
+    client: Any,
+    bucket: str,
+    key: str,
+    upload_id: str,
+    owner_args: Mapping[str, Any],
+    checkpoint: Path,
+) -> bool:
+    try:
+        _abort_upload(client, bucket, key, upload_id, owner_args)
+    except Exception as error:
+        if _error_code(error) not in {"NoSuchUpload", "404"}:
+            return False
+    checkpoint.unlink(missing_ok=True)
+    return True
+
+
 def send_file(
     source: str | os.PathLike[str],
     destination: str,
@@ -529,6 +575,7 @@ def send_file(
     plan = plan_file(path, destination, config=cfg)
     bucket, key = parse_s3_uri(destination)
     owner = _owner_args(extra)
+    conditional = _conditional_write_args(cfg.if_none_match, cfg.if_match)
     s3 = _get_client(client)
     started = time.monotonic()
 
@@ -563,20 +610,37 @@ def send_file(
         plan.part_size,
         cfg.checksum_algorithm,
         extra,
+        conditional,
     )
 
     if not plan.multipart:
         transfer_id = uuid.uuid4().hex
-        attempts = _put_small_file(
-            s3,
-            path,
-            bucket,
-            key,
-            cfg.checksum_algorithm,
-            extra,
-            transfer_id,
-            cfg.max_attempts,
-        )
+        completion_recovered = False
+        try:
+            attempts = _put_small_file(
+                s3,
+                path,
+                bucket,
+                key,
+                cfg.checksum_algorithm,
+                extra,
+                transfer_id,
+                cfg.max_attempts,
+                conditional,
+            )
+        except Exception:
+            completion_recovered = _object_matches(
+                s3,
+                bucket,
+                key,
+                plan.size_bytes,
+                transfer_id,
+                owner,
+                cfg.max_attempts,
+            )
+            if not completion_recovered:
+                raise
+            attempts = cfg.max_attempts
         _assert_source_unchanged(path, identity)
         if cfg.verify_after_upload:
             _verify_object(
@@ -605,6 +669,8 @@ def send_file(
                 "retries": attempts - 1,
                 "verified": cfg.verify_after_upload,
                 "transfer_id": transfer_id,
+                "destination_condition": conditional or None,
+                "completion_recovered": completion_recovered,
             },
         )
 
@@ -620,6 +686,10 @@ def send_file(
         upload_id = saved.get("upload_id")
         transfer_id = saved.get("transfer_id")
         if upload_id:
+            if not isinstance(upload_id, str) or not isinstance(transfer_id, str):
+                raise CheckpointError(
+                    f"upload checkpoint {checkpoint} is missing its upload identity"
+                )
             try:
                 remote = _call_with_retry(
                     lambda: _remote_parts(s3, bucket, key, upload_id, owner),
@@ -631,6 +701,52 @@ def send_file(
             except Exception as error:
                 if _error_code(error) not in {"NoSuchUpload", "404"}:
                     raise
+                if _object_matches(
+                    s3,
+                    bucket,
+                    key,
+                    plan.size_bytes,
+                    transfer_id,
+                    owner,
+                    cfg.max_attempts,
+                ):
+                    checkpoint.unlink(missing_ok=True)
+                    if progress:
+                        progress(plan.size_bytes, plan.size_bytes)
+                    elapsed = time.monotonic() - started
+                    emit(
+                        "resumed",
+                        plan.size_bytes,
+                        detail="recovered a commit completed before restart",
+                    )
+                    emit("completed", plan.size_bytes, concurrency=0)
+                    return TransferResult(
+                        kind="file",
+                        destination=destination,
+                        elapsed_seconds=elapsed,
+                        bytes_transferred=plan.size_bytes,
+                        throughput_mib_s=None,
+                        parts=plan.part_count,
+                        resumed=True,
+                        metadata={
+                            "plan": asdict(plan),
+                            "checksum": cfg.checksum_algorithm,
+                            "retries": 0,
+                            "reused_parts": 0,
+                            "verified": True,
+                            "completion_recovered": True,
+                            "recovery_phase": "restart",
+                            "transfer_id": transfer_id,
+                            "destination_condition": conditional or None,
+                            "adaptive": {
+                                "enabled": False,
+                                "initial_concurrency": 0,
+                                "final_concurrency": 0,
+                                "peak_concurrency": 0,
+                                "changes": [],
+                            },
+                        },
+                    )
                 upload_id = None
                 transfer_id = None
                 completed = {}
@@ -791,12 +907,13 @@ def send_file(
                 UploadId=upload_id,
                 MultipartUpload={"Parts": ordered},
                 **owner,
+                **conditional,
             )
 
         try:
             _call_with_retry(complete, cfg.max_attempts)
             committed = True
-        except Exception:
+        except Exception as error:
             completion_recovered = _object_matches(
                 s3,
                 bucket,
@@ -807,6 +924,17 @@ def send_file(
                 cfg.max_attempts,
             )
             if not completion_recovered:
+                if conditional and (
+                    _http_status(error) in {404, 409, 412}
+                    or _error_code(error)
+                    in {
+                        "ConditionalRequestConflict",
+                        "NoSuchKey",
+                        "NoSuchUpload",
+                        "PreconditionFailed",
+                    }
+                ):
+                    _discard_upload(s3, bucket, key, upload_id, owner, checkpoint)
                 raise
             committed = True
 
@@ -858,6 +986,7 @@ def send_file(
             "verified": cfg.verify_after_upload,
             "completion_recovered": completion_recovered,
             "transfer_id": transfer_id,
+            "destination_condition": conditional or None,
             "adaptive": {
                 "enabled": cfg.adaptive,
                 "initial_concurrency": controller.initial,

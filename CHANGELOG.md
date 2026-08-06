@@ -24,6 +24,11 @@ All notable changes will be documented here.
   JSON Lines/text from Spark executors and composes one verified S3 object.
 - Run-scoped staging discovery and optional post-verification cleanup, with
   failure-safe retention and cleanup status in result metadata.
+- Atomic create-only and compare-and-swap destination commits using S3
+  `If-None-Match`/`If-Match` on `PutObject` and `CompleteMultipartUpload`.
+- Ambiguous-response recovery for single-request `PutObject` uploads.
+- Restart recovery when S3 committed an object before the process could remove
+  its multipart checkpoint.
 
 ### Changed
 

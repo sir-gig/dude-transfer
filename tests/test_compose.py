@@ -127,6 +127,13 @@ class PreconditionFailedError(Exception):
     }
 
 
+class NoSuchUploadError(Exception):
+    response = {
+        "Error": {"Code": "NoSuchUpload"},
+        "ResponseMetadata": {"HTTPStatusCode": 404},
+    }
+
+
 class ChangedSourceComposeS3(FakeComposeS3):
     def __init__(self, sources):
         super().__init__(sources)
@@ -135,6 +142,32 @@ class ChangedSourceComposeS3(FakeComposeS3):
     def upload_part_copy(self, **kwargs):
         self.copy_attempts += 1
         raise PreconditionFailedError("source changed")
+
+
+class DestinationPreconditionComposeS3(FakeComposeS3):
+    def __init__(self, sources):
+        super().__init__(sources)
+        self.complete_attempts = 0
+
+    def complete_multipart_upload(self, **kwargs):
+        self.complete_attempts += 1
+        raise PreconditionFailedError("destination exists")
+
+
+class CrashAfterCommitComposeS3(FakeComposeS3):
+    def __init__(self, sources):
+        super().__init__(sources)
+        self.upload_gone = False
+
+    def list_parts(self, **kwargs):
+        if self.upload_gone:
+            raise NoSuchUploadError("upload committed")
+        return super().list_parts(**kwargs)
+
+    def complete_multipart_upload(self, **kwargs):
+        super().complete_multipart_upload(**kwargs)
+        self.upload_gone = True
+        raise SystemExit("simulated process death after commit")
 
 
 def source(size, etag, version_id=None):
@@ -245,6 +278,7 @@ def test_compose_uses_server_side_copy_in_order_and_preserves_sources(tmp_path):
             checkpoint_path=tmp_path / "compose.json",
             verify_after_compose=True,
             expected_source_bucket_owner="123456789012",
+            if_none_match=True,
         ),
         create_args={"ExpectedBucketOwner": "123456789012"},
         events=events.append,
@@ -264,6 +298,8 @@ def test_compose_uses_server_side_copy_in_order_and_preserves_sources(tmp_path):
     )
     assert events[0].phase == "planned"
     assert events[-1].phase == "completed"
+    assert client.completed["IfNoneMatch"] == "*"
+    assert result.metadata["destination_condition"] == {"IfNoneMatch": "*"}
 
 
 def test_compose_resumes_completed_server_side_parts(tmp_path):
@@ -309,9 +345,62 @@ def test_compose_recovers_lost_completion_response(tmp_path):
             max_attempts=1,
             checkpoint_path=tmp_path / "compose.json",
             verify_after_compose=True,
+            if_none_match=True,
         ),
     )
     assert result.metadata["completion_recovered"] is True
+    assert client.completed["IfNoneMatch"] == "*"
+
+
+def test_destination_precondition_is_atomic_not_retried_and_discards_upload(tmp_path):
+    sources = {("source", "a"): source(6 * MIB, '"a"')}
+    client = DestinationPreconditionComposeS3(sources)
+    checkpoint = tmp_path / "compose.json"
+    with pytest.raises(PreconditionFailedError, match="destination exists"):
+        compose_s3_objects(
+            ["s3://source/a"],
+            "s3://destination/result",
+            client=client,
+            config=ComposeConfig(
+                if_none_match=True,
+                max_attempts=4,
+                checkpoint_path=checkpoint,
+            ),
+        )
+    assert client.complete_attempts == 1
+    assert client.aborted["UploadId"] == "compose-1"
+    assert not checkpoint.exists()
+
+
+def test_restart_recovers_object_committed_before_checkpoint_cleanup(tmp_path):
+    sources = {("source", "a"): source(6 * MIB, '"a"')}
+    client = CrashAfterCommitComposeS3(sources)
+    checkpoint = tmp_path / "compose.json"
+    config = ComposeConfig(
+        if_none_match=True,
+        max_attempts=1,
+        checkpoint_path=checkpoint,
+    )
+    with pytest.raises(SystemExit, match="process death"):
+        compose_s3_objects(
+            ["s3://source/a"],
+            "s3://destination/result",
+            client=client,
+            config=config,
+        )
+    assert checkpoint.exists()
+
+    result = compose_s3_objects(
+        ["s3://source/a"],
+        "s3://destination/result",
+        client=client,
+        config=config,
+    )
+    assert result.resumed is True
+    assert result.metadata["completion_recovered"] is True
+    assert result.metadata["recovery_phase"] == "restart"
+    assert result.throughput_mib_s is None
+    assert not checkpoint.exists()
 
 
 def test_missing_copy_checksum_aborts_nonresumable_upload(tmp_path):
