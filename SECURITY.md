@@ -33,3 +33,13 @@ remain private until maintainers coordinate disclosure.
   condition or use `if_match` for an ETag-guarded compare-and-swap replacement.
 
 Dude is alpha software and has not received an independent security audit.
+
+## Release provenance
+
+GitHub Actions dependencies are pinned to full commit hashes. Tagged release
+artifacts receive a Sigstore-backed GitHub build-provenance attestation. Verify a
+download before installation with:
+
+```bash
+gh attestation verify dude_transfer-*.whl --repo sir-gig/dude-transfer
+```
