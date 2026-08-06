@@ -9,7 +9,7 @@
 ## Make tuning adaptive
 
 - Estimate compressed output size from a bounded sample.
-- Adjust concurrency from observed throughput, throttling, CPU, and memory.
+- Extend the initial throughput/retry controller with throttling, CPU, and NIC signals.
 - Learn safe defaults per cluster and bucket without retaining payload data.
 - Report the limiting stage with evidence from Spark and S3 telemetry.
 
@@ -18,7 +18,8 @@
 - Compact existing small objects.
 - Incrementally transfer only changed partitions.
 - Store durable checkpoints outside ephemeral driver storage.
-- Add a distributed single-object writer for safely concatenable formats.
+- Extend the new executor-staged JSONL/text single-object path with durable
+  external manifests and richer skew repair for undersized nonfinal chunks.
 - Add OpenTelemetry metrics and structured audit events.
 
 ## Harden releases
