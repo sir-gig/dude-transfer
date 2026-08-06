@@ -39,6 +39,8 @@ All notable changes will be documented here.
   generated exact-prefix session policy instead of stored AWS access keys.
 - Live S3 coverage for exact multipart file bytes, checkpoint cleanup, and an
   atomic create-only collision that must preserve the first committed object.
+- A split, least-privilege release pipeline with unprivileged builds, immutable
+  artifact handoff, isolated provenance, and PyPI Trusted Publishing.
 
 ### Changed
 
@@ -52,6 +54,7 @@ All notable changes will be documented here.
 - `maxRecordsPerFile` is rejected for single-object DataFrame writes because it
   can recreate illegal undersized chunks after partition repair.
 - Pull requests no longer launch a duplicate CI matrix from their branch push.
+- Release tags are rejected unless their commit is already contained in `main`.
 
 ### Fixed
 
