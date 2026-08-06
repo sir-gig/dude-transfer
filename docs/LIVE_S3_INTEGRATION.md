@@ -1,9 +1,11 @@
 # Live S3 integration setup
 
 The `Live S3 contract` workflow is manually dispatched and writes only synthetic
-bytes beneath a random child of the selected prefix. It verifies the destination
-byte for byte and requests deletion of its three exact object keys. Use a
-disposable bucket with a lifecycle policy; never target production data.
+bytes beneath random children of the selected prefix. It verifies server-side
+composition and a three-part multipart file upload byte for byte, proves that an
+atomic create-only collision cannot replace the uploaded object, and requests
+deletion only for each test's exact object keys. Use a disposable bucket with a
+lifecycle policy; never target production data.
 
 The workflow accepts no AWS access keys. It exchanges GitHub's short-lived OIDC
 token for an IAM role session and applies an additional inline session policy

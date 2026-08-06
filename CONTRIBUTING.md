@@ -14,9 +14,10 @@ python -m ruff check .
 Python 3.10 or newer is required. Spark and live AWS credentials are not needed
 for the unit test suite.
 
-An opt-in live contract test writes 7 MiB of synthetic data under a random S3
-prefix, verifies server-side composition byte for byte, and issues cleanup only
-for its three exact object keys:
+Opt-in live contracts write synthetic data under random S3 prefixes. They verify
+7 MiB server-side composition plus an 11 MiB three-part file upload byte for
+byte, exercise atomic create-only collision handling, and issue cleanup only for
+their exact object keys:
 
 ```bash
 DUDE_INTEGRATION_BUCKET=my-disposable-test-bucket python -m pytest -m integration

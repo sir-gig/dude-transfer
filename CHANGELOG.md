@@ -37,6 +37,8 @@ All notable changes will be documented here.
   cleanup results for repaired exports.
 - A manual, protected-environment live S3 workflow using GitHub OIDC and a
   generated exact-prefix session policy instead of stored AWS access keys.
+- Live S3 coverage for exact multipart file bytes, checkpoint cleanup, and an
+  atomic create-only collision that must preserve the first committed object.
 
 ### Changed
 
