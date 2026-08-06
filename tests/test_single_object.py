@@ -33,6 +33,24 @@ class StageWriter(FakeWriter):
             self.client.sources[(bucket, key)] = source(size, f'"{name}"')
 
 
+class RetryStageWriter(FakeWriter):
+    def __init__(self, client, outputs_by_attempt):
+        super().__init__()
+        self.client = client
+        self.outputs_by_attempt = outputs_by_attempt
+        self.save_count = 0
+
+    def save(self, destination):
+        FakeWriter.save(self, destination)
+        bucket, prefix = parse_s3_uri(destination)
+        outputs = self.outputs_by_attempt[self.save_count]
+        self.save_count += 1
+        for name, size in outputs:
+            key = f"{prefix}{name}"
+            self.client.stage_objects[(bucket, key)] = size
+            self.client.sources[(bucket, key)] = source(size, f'"{name}-{self.save_count}"')
+
+
 class SingleObjectS3(FakeComposeS3):
     def __init__(self):
         super().__init__({})
@@ -121,6 +139,12 @@ def dataframe_with_outputs(client, outputs):
     return df
 
 
+def dataframe_with_output_attempts(client, outputs_by_attempt):
+    df = FakeDataFrame(size=20 * MIB, partitions=len(outputs_by_attempt[0]))
+    df.write = RetryStageWriter(client, outputs_by_attempt)
+    return df
+
+
 def test_dataframe_jsonl_stages_in_parallel_and_composes_in_numeric_order(tmp_path):
     client = SingleObjectS3()
     df = dataframe_with_outputs(
@@ -183,16 +207,181 @@ def test_failed_compose_preserves_owned_staging_objects(tmp_path):
             ("part-00001-run-c000.json", 6 * MIB),
         ],
     )
-    with pytest.raises(ConfigurationError, match="except the final"):
+    with pytest.raises(ConfigurationError, match="undersized nonfinal"):
         send_dataframe_as_single_object(
             df,
             "s3://destination/final/run.jsonl",
             client=client,
+            max_skew_retries=0,
             compose_config=ComposeConfig(checkpoint_path=tmp_path / "compose.json"),
         )
     assert len(client.stage_objects) == 2
     assert client.delete_requests == []
     assert client.destination is None
+
+
+def test_skewed_stage_is_rewritten_with_measured_parallelism(tmp_path):
+    client = SingleObjectS3()
+    df = dataframe_with_output_attempts(
+        client,
+        [
+            [
+                ("part-00000-run-c000.json", MIB),
+                ("part-00001-run-c000.json", 19 * MIB),
+            ],
+            [
+                ("part-00000-run-c000.json", 10 * MIB),
+                ("part-00001-run-c000.json", 10 * MIB),
+            ],
+        ],
+    )
+    events = []
+
+    result = send_dataframe_as_single_object(
+        df,
+        "s3://destination/final/repaired.jsonl",
+        target_file_size="8MiB",
+        client=client,
+        compose_config=ComposeConfig(checkpoint_path=tmp_path / "compose.json"),
+        events=events.append,
+    )
+
+    assert df.repartitioned == 2
+    assert result.bytes_transferred == 20 * MIB
+    assert result.metadata["skew_repair"] == {
+        "enabled": True,
+        "max_retries": 2,
+        "rewrites": 1,
+        "repaired": True,
+        "final_requested_partitions": 2,
+    }
+    assert len(result.metadata["staging_attempts"]) == 2
+    assert result.metadata["staging_attempts"][0]["valid_for_compose"] is False
+    assert result.metadata["staging_attempts"][1]["valid_for_compose"] is True
+    assert result.metadata["staging_cleanup"]["completed"] is True
+    assert result.metadata["staging_cleanup"]["deleted_objects"] == 4
+    assert len(result.metadata["staging_cleanup"]["attempts"]) == 2
+    assert not client.stage_objects
+    assert "dataframe_staging_skew_detected" in [event.phase for event in events]
+    assert "dataframe_staging_repartitioned" in [event.phase for event in events]
+
+
+def test_exhausted_skew_repair_cleans_prior_attempt_and_retains_last(tmp_path):
+    client = SingleObjectS3()
+    skewed = [
+        ("part-00000-run-c000.json", MIB),
+        ("part-00001-run-c000.json", 19 * MIB),
+    ]
+    df = dataframe_with_output_attempts(client, [skewed, skewed])
+
+    with pytest.raises(ConfigurationError, match="stopped after 1 rewrite"):
+        send_dataframe_as_single_object(
+            df,
+            "s3://destination/final/exhausted.jsonl",
+            target_file_size="8MiB",
+            max_skew_retries=1,
+            client=client,
+            compose_config=ComposeConfig(checkpoint_path=tmp_path / "compose.json"),
+        )
+
+    assert len(client.delete_requests) == 1
+    assert len(client.stage_objects) == 2
+    assert all("attempt-01/" in key for _, key in client.stage_objects)
+    assert client.destination is None
+
+
+def test_small_export_can_use_one_partition_repair(tmp_path):
+    client = SingleObjectS3()
+    df = dataframe_with_output_attempts(
+        client,
+        [
+            [
+                ("part-00000-run-c000.json", MIB),
+                ("part-00001-run-c000.json", 6 * MIB),
+            ],
+            [("part-00000-run-c000.json", 7 * MIB)],
+        ],
+    )
+
+    result = send_dataframe_as_single_object(
+        df,
+        "s3://destination/final/small.jsonl",
+        target_file_size="8MiB",
+        client=client,
+        compose_config=ComposeConfig(checkpoint_path=tmp_path / "compose.json"),
+    )
+
+    assert result.metadata["skew_repair"]["final_requested_partitions"] == 1
+    assert result.metadata["skew_repair"]["rewrites"] == 1
+    assert result.bytes_transferred == 7 * MIB
+
+
+def test_skew_repair_cleanup_failures_are_reported_after_commit(tmp_path):
+    client = CleanupDeniedS3()
+    df = dataframe_with_output_attempts(
+        client,
+        [
+            [
+                ("part-00000-run-c000.json", MIB),
+                ("part-00001-run-c000.json", 19 * MIB),
+            ],
+            [
+                ("part-00000-run-c000.json", 10 * MIB),
+                ("part-00001-run-c000.json", 10 * MIB),
+            ],
+        ],
+    )
+
+    result = send_dataframe_as_single_object(
+        df,
+        "s3://destination/final/cleanup-report.jsonl",
+        target_file_size="8MiB",
+        client=client,
+        compose_config=ComposeConfig(checkpoint_path=tmp_path / "compose.json"),
+    )
+
+    cleanup = result.metadata["staging_cleanup"]
+    assert cleanup["completed"] is False
+    assert cleanup["deleted_objects"] == 0
+    assert len(cleanup["attempts"]) == 2
+    assert len(cleanup["errors"]) == 2
+    assert client.destination["size"] == 20 * MIB
+    assert len(client.stage_objects) == 4
+
+
+def test_skew_repair_retains_every_attempt_when_cleanup_is_disabled(tmp_path):
+    client = SingleObjectS3()
+    df = dataframe_with_output_attempts(
+        client,
+        [
+            [
+                ("part-00000-run-c000.json", MIB),
+                ("part-00001-run-c000.json", 19 * MIB),
+            ],
+            [
+                ("part-00000-run-c000.json", 10 * MIB),
+                ("part-00001-run-c000.json", 10 * MIB),
+            ],
+        ],
+    )
+
+    result = send_dataframe_as_single_object(
+        df,
+        "s3://destination/final/retained.jsonl",
+        target_file_size="8MiB",
+        cleanup_staging=False,
+        client=client,
+        compose_config=ComposeConfig(checkpoint_path=tmp_path / "compose.json"),
+    )
+
+    assert result.metadata["staging_cleanup"] == {
+        "requested": False,
+        "completed": False,
+        "deleted_objects": 0,
+        "attempts": [],
+    }
+    assert len(client.stage_objects) == 4
+    assert client.delete_requests == []
 
 
 def test_cleanup_can_be_disabled(tmp_path):
@@ -328,7 +517,10 @@ def test_staging_cleanup_refuses_keys_outside_owned_run():
         ({"file_format": "parquet"}, "only json or text"),
         ({"options": {"compression": "gzip"}}, "must be uncompressed"),
         ({"options": {"lineSep": "|"}}, "newline separator"),
+        ({"options": {"maxRecordsPerFile": 100}}, "cannot use maxRecordsPerFile"),
         ({"target_file_size": "1MiB"}, "at least 5 MiB"),
+        ({"max_skew_retries": -1}, "nonnegative integer"),
+        ({"max_skew_retries": True}, "nonnegative integer"),
     ],
 )
 def test_unsafe_single_object_formats_and_options_fail_before_write(

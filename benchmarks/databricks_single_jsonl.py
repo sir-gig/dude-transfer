@@ -19,17 +19,21 @@ dbutils.widgets.text("destination", "s3://replace-me/dude-single-object-benchmar
 dbutils.widgets.text("target_file_size", "256MiB")
 dbutils.widgets.text("expected_bucket_owner", "")
 dbutils.widgets.text("repetitions", "3")
+dbutils.widgets.text("max_skew_retries", "2")
 
 source_table = dbutils.widgets.get("source_table")
 destination = dbutils.widgets.get("destination").rstrip("/")
 target_file_size = dbutils.widgets.get("target_file_size")
 expected_bucket_owner = dbutils.widgets.get("expected_bucket_owner").strip() or None
 repetitions = int(dbutils.widgets.get("repetitions"))
+max_skew_retries = int(dbutils.widgets.get("max_skew_retries"))
 
 if destination.startswith("s3://replace-me/"):
     raise ValueError("set the destination widget to an authorized benchmark prefix")
 if repetitions < 1:
     raise ValueError("repetitions must be positive")
+if max_skew_retries < 0:
+    raise ValueError("max_skew_retries must be nonnegative")
 
 run_id = uuid.uuid4().hex
 df = spark.table(source_table)
@@ -82,6 +86,7 @@ def dude_write(repetition):
         df,
         output,
         target_file_size=target_file_size,
+        max_skew_retries=max_skew_retries,
         compose_config=ComposeConfig(
             initial_concurrency=4,
             max_concurrency=16,
@@ -117,6 +122,7 @@ report = {
     "run_id": run_id,
     "source_table": source_table,
     "target_file_size": target_file_size,
+    "max_skew_retries": max_skew_retries,
     "diagnostics": [item.as_dict() for item in diagnose_dataframe(df)],
     "results": results,
     "notes": [

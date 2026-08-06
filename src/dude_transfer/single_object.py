@@ -6,7 +6,7 @@ import re
 import time
 import uuid
 from collections.abc import Callable, Mapping
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any
 from urllib.parse import quote
 
@@ -15,6 +15,7 @@ from .dataframe import send_dataframe
 from .exceptions import ConfigurationError
 from .models import TransferEvent, TransferResult
 from .s3 import (
+    S3_MIN_PART_SIZE,
     _call_with_retry,
     _conditional_write_args,
     _creation_args,
@@ -30,6 +31,26 @@ from .utils import MIB, parse_size
 
 _PARTITION_PATTERN = re.compile(r"^part-(\d+)(?:-|$)")
 _CHUNK_PATTERN = re.compile(r"-c(\d+)(?:\.|$)")
+
+
+@dataclass(frozen=True)
+class _StageListing:
+    sources: tuple[str, ...]
+    keys: tuple[str, ...]
+    payload_sizes: tuple[int, ...]
+    size_bytes: int
+
+    @property
+    def undersized_nonfinal(self) -> tuple[tuple[str, int], ...]:
+        return tuple(
+            (uri, size)
+            for uri, size in zip(
+                self.sources[:-1],
+                self.payload_sizes[:-1],
+                strict=True,
+            )
+            if size < S3_MIN_PART_SIZE
+        )
 
 
 def _stage_prefix(destination: str, staging_prefix: str | None, run_id: str) -> str:
@@ -90,12 +111,12 @@ def _stage_sort_key(key: str) -> tuple[int, int, str]:
     return int(partition.group(1)), int(chunk.group(1)) if chunk else 0, key
 
 
-def _list_stage(
+def _inspect_stage(
     client: Any,
     stage_uri: str,
     request_args: Mapping[str, Any],
     max_attempts: int,
-) -> tuple[list[str], list[str], int]:
+) -> _StageListing:
     bucket, prefix = parse_s3_uri(stage_uri)
     all_keys: list[str] = []
     payloads: list[tuple[str, int]] = []
@@ -127,8 +148,97 @@ def _list_stage(
         token = str(response["NextContinuationToken"])
 
     payloads.sort(key=lambda item: _stage_sort_key(item[0]))
-    sources = [f"s3://{bucket}/{quote(key, safe='/')}" for key, _ in payloads]
-    return sources, all_keys, sum(size for _, size in payloads)
+    return _StageListing(
+        sources=tuple(
+            f"s3://{bucket}/{quote(key, safe='/')}" for key, _ in payloads
+        ),
+        keys=tuple(all_keys),
+        payload_sizes=tuple(size for _, size in payloads),
+        size_bytes=sum(size for _, size in payloads),
+    )
+
+
+def _list_stage(
+    client: Any,
+    stage_uri: str,
+    request_args: Mapping[str, Any],
+    max_attempts: int,
+) -> tuple[list[str], list[str], int]:
+    """Return the historical tuple view used by callers of this internal helper."""
+
+    listing = _inspect_stage(client, stage_uri, request_args, max_attempts)
+    return list(listing.sources), list(listing.keys), listing.size_bytes
+
+
+def _repair_partition_count(
+    listing: _StageListing,
+    staged: TransferResult,
+    previous_repair_partitions: int | None,
+    target_file_size: int,
+) -> int | None:
+    """Choose a smaller, shuffled layout from measured output sizes.
+
+    The first repair may keep the observed payload count because the forced
+    Spark shuffle itself removes inherited partition skew. Later repairs halve
+    the count. A one-partition fallback is permitted only when the complete
+    payload already fits within the requested target object size.
+    """
+
+    observed = len(listing.sources)
+    if observed <= 1:
+        return None
+    planned = staged.parts if staged.parts > 0 else observed
+    current = max(1, min(planned, observed))
+    maximum_by_measured_bytes = max(
+        1,
+        listing.size_bytes // (2 * S3_MIN_PART_SIZE),
+    )
+    if previous_repair_partitions is None:
+        candidate = min(current, maximum_by_measured_bytes)
+    else:
+        if previous_repair_partitions <= 1:
+            return None
+        candidate = min(
+            max(1, previous_repair_partitions // 2),
+            maximum_by_measured_bytes,
+        )
+    if candidate == 1 and listing.size_bytes > target_file_size:
+        return None
+    return candidate
+
+
+def _aggregate_cleanup(
+    requested: bool,
+    records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if not requested:
+        return {
+            "requested": False,
+            "completed": False,
+            "deleted_objects": 0,
+            "attempts": [],
+        }
+    result: dict[str, Any] = {
+        "requested": True,
+        "completed": bool(records) and all(item["completed"] for item in records),
+        "deleted_objects": sum(int(item["deleted_objects"]) for item in records),
+        "attempts": records,
+    }
+    failed = [item for item in records if not item["completed"]]
+    if len(records) == 1 and failed:
+        if "error" in failed[0]:
+            result["error"] = failed[0]["error"]
+        if "errors" in failed[0]:
+            result["errors"] = failed[0]["errors"]
+    elif failed:
+        result["errors"] = [
+            {
+                "staging_prefix": item["staging_prefix"],
+                "error": item.get("error", item.get("errors")),
+            }
+            for item in failed
+        ]
+    return result
 
 
 def _cleanup_stage(
@@ -236,6 +346,7 @@ def send_dataframe_as_single_object(
     options: Mapping[str, Any] | None = None,
     staging_prefix: str | None = None,
     cleanup_staging: bool = True,
+    max_skew_retries: int = 2,
     compose_config: ComposeConfig | None = None,
     client: Any | None = None,
     create_args: Mapping[str, Any] | None = None,
@@ -247,13 +358,18 @@ def send_dataframe_as_single_object(
     JSON output is newline-delimited JSON. Text output uses Spark's one-string-
     column text data source. DataFrames have no implicit global row ordering;
     Dude preserves Spark partition and chunk order in the resulting byte stream.
+    When measured staging objects violate S3's nonfinal 5 MiB minimum, Dude can
+    force up to ``max_skew_retries`` progressively smaller Spark shuffles.
     """
 
     normalized_format = file_format.lower()
     if normalized_format not in {"json", "text"}:
         raise ConfigurationError("single-object DataFrames support only json or text")
-    if parse_size(target_file_size) < 5 * MIB:
+    target_bytes = parse_size(target_file_size)
+    if target_bytes < S3_MIN_PART_SIZE:
         raise ConfigurationError("target_file_size must be at least 5 MiB for S3 composition")
+    if type(max_skew_retries) is not int or max_skew_retries < 0:
+        raise ConfigurationError("max_skew_retries must be a nonnegative integer")
 
     output_options = dict(options or {})
     normalized_options = {str(key).lower(): value for key, value in output_options.items()}
@@ -266,6 +382,11 @@ def send_dataframe_as_single_object(
     encoding = str(normalized_options.get("encoding", "utf-8")).replace("_", "-").lower()
     if encoding not in {"utf-8", "utf8"}:
         raise ConfigurationError("single-object DataFrame output requires UTF-8")
+    if "maxrecordsperfile" in normalized_options:
+        raise ConfigurationError(
+            "single-object DataFrame output cannot use maxRecordsPerFile because it "
+            "can create undersized chunks after skew repair"
+        )
     for key in list(output_options):
         if str(key).lower() in {"compression", "linesep", "encoding"}:
             output_options.pop(key)
@@ -294,8 +415,12 @@ def send_dataframe_as_single_object(
     )
 
     run_id = uuid.uuid4().hex
-    stage_uri = _stage_prefix(destination, staging_prefix, run_id)
-    stage_bucket, _ = parse_s3_uri(stage_uri)
+    first_stage_uri = _stage_prefix(
+        destination,
+        staging_prefix,
+        f"{run_id}/attempt-00",
+    )
+    stage_bucket, _ = parse_s3_uri(first_stage_uri)
     destination_bucket, _ = parse_s3_uri(destination)
     if (
         stage_bucket == destination_bucket
@@ -324,30 +449,145 @@ def send_dataframe_as_single_object(
                 )
             )
 
-    emit("dataframe_staging_started", 0, 0, stage_uri)
-    try:
-        staged = send_dataframe(
-            df,
-            stage_uri,
-            file_format=normalized_format,
-            mode="errorifexists",
-            compression=None,
-            target_file_size=target_file_size,
-            min_partitions=min_partitions,
-            max_partitions=max_partitions,
-            partitions=partitions,
-            options=output_options,
+    staging_attempts: list[dict[str, Any]] = []
+    cleanup_records: list[dict[str, Any]] = []
+    repair_rewrites = 0
+    previous_repair_partitions: int | None = None
+    requested_partitions = partitions
+    working_df = df
+
+    while True:
+        stage_uri = _stage_prefix(
+            destination,
+            staging_prefix,
+            f"{run_id}/attempt-{len(staging_attempts):02d}",
         )
-        sources, stage_keys, staged_bytes = _list_stage(
-            s3,
-            stage_uri,
-            stage_request_args,
-            cfg.max_attempts,
+        emit("dataframe_staging_started", 0, 0, stage_uri)
+        try:
+            staged = send_dataframe(
+                working_df,
+                stage_uri,
+                file_format=normalized_format,
+                mode="errorifexists",
+                compression=None,
+                target_file_size=target_bytes,
+                min_partitions=min_partitions,
+                max_partitions=max_partitions,
+                partitions=requested_partitions,
+                options=output_options,
+            )
+            listing = _inspect_stage(
+                s3,
+                stage_uri,
+                stage_request_args,
+                cfg.max_attempts,
+            )
+        except BaseException as error:
+            emit(
+                "dataframe_staging_failed",
+                0,
+                0,
+                f"{stage_uri}; {type(error).__name__}",
+            )
+            raise
+
+        undersized = listing.undersized_nonfinal
+        attempt_record: dict[str, Any] = {
+            "attempt": len(staging_attempts),
+            "staging_prefix": stage_uri,
+            "requested_partitions": requested_partitions,
+            "payload_objects": len(listing.sources),
+            "staging_objects": len(listing.keys),
+            "size_bytes": listing.size_bytes,
+            "undersized_nonfinal_objects": [
+                {"uri": uri, "size_bytes": size} for uri, size in undersized
+            ],
+            "valid_for_compose": not undersized,
+            "staging_write": staged.as_dict(),
+        }
+        staging_attempts.append(attempt_record)
+        emit(
+            "dataframe_staging_completed",
+            listing.size_bytes,
+            listing.size_bytes,
+            f"attempt={attempt_record['attempt']}; payload_objects={len(listing.sources)}",
         )
-    except BaseException as error:
-        emit("dataframe_staging_failed", 0, 0, f"{stage_uri}; {type(error).__name__}")
-        raise
-    emit("dataframe_staging_completed", staged_bytes, staged_bytes)
+        if not undersized:
+            break
+
+        emit(
+            "dataframe_staging_skew_detected",
+            listing.size_bytes,
+            listing.size_bytes,
+            f"attempt={attempt_record['attempt']}; undersized_nonfinal={len(undersized)}",
+        )
+        next_partitions = _repair_partition_count(
+            listing,
+            staged,
+            previous_repair_partitions,
+            target_bytes,
+        )
+        if repair_rewrites >= max_skew_retries or next_partitions is None:
+            reason = (
+                f"staging produced {len(undersized)} undersized nonfinal object(s); "
+                f"automatic skew repair stopped after {repair_rewrites} rewrite(s); "
+                f"retained staging prefix: {stage_uri}"
+            )
+            emit(
+                "dataframe_staging_skew_exhausted",
+                listing.size_bytes,
+                listing.size_bytes,
+                reason,
+            )
+            raise ConfigurationError(reason)
+
+        try:
+            repair_df = df.repartition(next_partitions)
+        except BaseException as error:
+            emit(
+                "dataframe_staging_failed",
+                listing.size_bytes,
+                listing.size_bytes,
+                f"{stage_uri}; repartition; {type(error).__name__}",
+            )
+            raise
+
+        if cleanup_staging:
+            cleanup_record = _cleanup_stage(
+                s3,
+                stage_uri,
+                list(listing.keys),
+                stage_request_args,
+                cfg.max_attempts,
+            )
+            cleanup_record["staging_prefix"] = stage_uri
+            cleanup_records.append(cleanup_record)
+            attempt_record["cleanup"] = cleanup_record
+            emit(
+                "staging_cleanup_completed"
+                if cleanup_record["completed"]
+                else "staging_cleanup_failed",
+                listing.size_bytes,
+                listing.size_bytes,
+                None
+                if cleanup_record["completed"]
+                else str(cleanup_record.get("error", cleanup_record.get("errors"))),
+            )
+
+        repair_rewrites += 1
+        previous_repair_partitions = next_partitions
+        requested_partitions = next_partitions
+        working_df = repair_df
+        emit(
+            "dataframe_staging_repartitioned",
+            0,
+            listing.size_bytes,
+            f"rewrite={repair_rewrites}; partitions={next_partitions}",
+        )
+
+    sources = list(listing.sources)
+    stage_keys = list(listing.keys)
+    staged_bytes = listing.size_bytes
 
     def forward_event(item: TransferEvent) -> None:
         if events:
@@ -386,21 +626,28 @@ def send_dataframe_as_single_object(
         )
         raise
 
-    cleanup = {"requested": False, "completed": False, "deleted_objects": 0}
     if cleanup_staging:
-        cleanup = _cleanup_stage(
+        cleanup_record = _cleanup_stage(
             s3,
             stage_uri,
             stage_keys,
             stage_request_args,
             cfg.max_attempts,
         )
+        cleanup_record["staging_prefix"] = stage_uri
+        cleanup_records.append(cleanup_record)
+        staging_attempts[-1]["cleanup"] = cleanup_record
         emit(
-            "staging_cleanup_completed" if cleanup["completed"] else "staging_cleanup_failed",
+            "staging_cleanup_completed"
+            if cleanup_record["completed"]
+            else "staging_cleanup_failed",
             staged_bytes,
             staged_bytes,
-            None if cleanup["completed"] else str(cleanup.get("error", cleanup.get("errors"))),
+            None
+            if cleanup_record["completed"]
+            else str(cleanup_record.get("error", cleanup_record.get("errors"))),
         )
+    cleanup = _aggregate_cleanup(cleanup_staging, cleanup_records)
 
     elapsed = time.monotonic() - started
     emit("single_object_completed", staged_bytes, staged_bytes)
@@ -418,6 +665,14 @@ def send_dataframe_as_single_object(
             "staged_payload_objects": len(sources),
             "staging_cleanup": cleanup,
             "staging_write": staged.as_dict(),
+            "staging_attempts": staging_attempts,
+            "skew_repair": {
+                "enabled": max_skew_retries > 0,
+                "max_retries": max_skew_retries,
+                "rewrites": repair_rewrites,
+                "repaired": repair_rewrites > 0,
+                "final_requested_partitions": requested_partitions,
+            },
             "composition": result_metadata,
             "transfer_id": transfer_id,
             "completion_recovered": completion_recovered,

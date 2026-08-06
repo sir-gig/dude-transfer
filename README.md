@@ -112,10 +112,21 @@ metadata without hiding a successfully committed destination.
 
 Spark DataFrames have no implicit global row order. Dude preserves Spark's
 partition/chunk order but does not invent a row-order guarantee. Each nonfinal
-payload object must meet S3's 5 MiB multipart minimum; if skew creates a smaller
-object, Dude fails closed and retains the staging run. `mode="errorifexists"`
-uses S3's atomic `If-None-Match: *` condition at object commit, so concurrent
-writers cannot silently replace the destination.
+payload object must meet S3's 5 MiB multipart minimum. Dude measures the actual
+staged objects and, when skew violates that rule, forces a balanced Spark shuffle
+with measured lower parallelism before trying composition. The default permits
+two rewrites; set `max_skew_retries=0` to fail closed immediately. A one-partition
+repair is used only when the entire payload fits the requested `target_file_size`,
+so a multi-gigabyte export does not silently collapse back to the slow path.
+
+Every staging attempt, undersized object, chosen partition count, and cleanup
+outcome is returned in `staging_attempts`, `skew_repair`, and `staging_cleanup`
+metadata and emitted as structured events. Rewrites evaluate the DataFrame again;
+materialize or persist nondeterministic inputs when repeat evaluation matters.
+When repair is exhausted, the final run remains available at the staging URI in
+the exception and earlier owned attempts are cleaned when requested.
+`mode="errorifexists"` uses S3's atomic `If-None-Match: *` condition at object
+commit, so concurrent writers cannot silently replace the destination.
 
 ## Send one file
 
