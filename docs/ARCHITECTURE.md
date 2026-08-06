@@ -55,12 +55,19 @@ Spark DataFrame
       |
       +-- executors write uncompressed JSONL/text to a random staging prefix
       +-- list committed part objects and sort numeric partition/chunk IDs
+      +-- measure S3 part sizes; reshuffle skewed output with lower parallelism
       +-- run the verified S3 composition path
       `-- optionally delete only the owned staging-run keys
 ```
 
 The orchestrator never collects rows and never transfers payload bytes through
-the client. Failed staging or composition leaves the run prefix intact. Cleanup
+the client. An undersized nonfinal object triggers a bounded sequence of forced
+Spark shuffles chosen from actual staged bytes. A serial repair is allowed only
+when the complete output is no larger than the configured target object size.
+Earlier invalid attempt prefixes are cleaned before the next write when cleanup
+is enabled; the final failed prefix is retained. Cleanup results across every
+attempt remain visible, including orphaned prefixes when deletion is denied.
+Failed staging or composition leaves its current run prefix intact. Final cleanup
 is attempted only after destination verification; cleanup errors are returned as
 metadata because the destination has already committed successfully.
 

@@ -18,8 +18,8 @@
 - Compact existing small objects.
 - Incrementally transfer only changed partitions.
 - Store durable checkpoints outside ephemeral driver storage.
-- Extend the new executor-staged JSONL/text single-object path with durable
-  external manifests and richer skew repair for undersized nonfinal chunks.
+- Extend the executor-staged JSONL/text single-object path with durable external
+  manifests that can be handed between jobs and clusters.
 - Add OpenTelemetry metrics and structured audit events.
 
 ## Harden releases

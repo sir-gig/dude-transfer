@@ -29,6 +29,12 @@ Lines write with parallel executor staging plus S3-side composition. Upload it
 as a Databricks notebook, configure an authorized synthetic source and unique
 benchmark prefix, and publish the complete JSON report rather than a screenshot.
 
+`databricks_skew_repair.py` creates a synthetic, uncompressed JSON Lines dataset
+with a deliberately tiny first partition. It verifies that the first staging
+layout is rejected, Dude chooses a measured Spark reshuffle, and the successful
+result still reports zero client-downloaded payload bytes. Use it to publish the
+repair overhead and every `staging_attempts` record, not only the final runtime.
+
 Record these dimensions with every result:
 
 - Databricks runtime, access mode, worker and driver types, and worker count.
