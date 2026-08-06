@@ -203,7 +203,10 @@ def test_failed_upload_resumes_remote_parts(tmp_path):
     result = send_file(source, "s3://bucket/key", config=config, client=client)
     assert result.resumed is True
     assert result.parts == 3
-    assert result.metadata["reused_parts"] == 1
+    # Either successful in-flight part may finish before the sibling failure is
+    # observed. Resume must reuse every remotely committed part, independent of
+    # thread scheduling.
+    assert 1 <= result.metadata["reused_parts"] <= 2
     assert not checkpoint.exists()
 
 
