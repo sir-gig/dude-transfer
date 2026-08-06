@@ -20,6 +20,7 @@ from .models import (
     TransferResult,
 )
 from .s3 import MultipartConfig, plan_file, send_file
+from .single_object import send_dataframe_as_single_object
 
 __all__ = [
     "CheckpointError",
@@ -43,5 +44,6 @@ __all__ = [
     "plan_file",
     "send",
     "send_dataframe",
+    "send_dataframe_as_single_object",
     "send_file",
 ]

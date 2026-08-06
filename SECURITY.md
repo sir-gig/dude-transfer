@@ -24,5 +24,10 @@ remain private until maintainers coordinate disclosure.
   for versioned buckets, the inspected version ID.
 - Dude does not delete composition sources. Cleanup is a separate, explicitly
   authorized operation after callers validate the resulting object.
+- The high-level DataFrame single-object API may clean up staging objects it
+  created under a random run-specific prefix. Cleanup occurs only after destination
+  verification, refuses keys outside that exact prefix, and can be disabled.
+- `errorifexists` uses a preflight `HeadObject`; with SDKs that lack conditional
+  multipart completion it is not an atomic lock against another concurrent writer.
 
 Dude is alpha software and has not received an independent security audit.

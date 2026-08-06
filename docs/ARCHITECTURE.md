@@ -48,6 +48,22 @@ on S3's data plane. Source objects are preserved. The operation is byte
 concatenation, so it is valid only when the staged format is itself safely
 concatenable. Independent Parquet objects are not a valid input for this path.
 
+## DataFrame-to-one-object orchestration
+
+```text
+Spark DataFrame
+      |
+      +-- executors write uncompressed JSONL/text to a random staging prefix
+      +-- list committed part objects and sort numeric partition/chunk IDs
+      +-- run the verified S3 composition path
+      `-- optionally delete only the owned staging-run keys
+```
+
+The orchestrator never collects rows and never transfers payload bytes through
+the client. Failed staging or composition leaves the run prefix intact. Cleanup
+is attempted only after destination verification; cleanup errors are returned as
+metadata because the destination has already committed successfully.
+
 The adaptive controller begins conservatively, probes upward when aggregate
 throughput improves, and applies multiplicative backoff when a part requires a
 retry. Every adjustment is returned as structured result metadata and can be

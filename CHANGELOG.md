@@ -20,6 +20,10 @@ All notable changes will be documented here.
 - Source ETag/version pinning, resumable copy-part reconciliation, and ambiguous
   completion recovery for server-side composition.
 - `plan-compose` and `compose-s3` CLI commands.
+- A high-level `send_dataframe_as_single_object` path that stages uncompressed
+  JSON Lines/text from Spark executors and composes one verified S3 object.
+- Run-scoped staging discovery and optional post-verification cleanup, with
+  failure-safe retention and cleanup status in result metadata.
 
 ### Changed
 

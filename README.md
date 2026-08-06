@@ -80,6 +80,41 @@ not the exact compressed S3 object size.
 Use an external location or external volume backed by the target S3 prefix so
 Unity Catalog governs the write. Do not place AWS access keys in notebook code.
 
+### Produce one JSON Lines object without serializing Spark
+
+When a downstream system requires one object rather than a Spark dataset, let
+executors write JSON Lines chunks in parallel and have S3 assemble them:
+
+```python
+from dude_transfer import ComposeConfig, send_dataframe_as_single_object
+
+result = send_dataframe_as_single_object(
+    df,
+    "s3://my-lab-data/exports/run-42.jsonl",
+    target_file_size="256MiB",
+    compose_config=ComposeConfig(
+        initial_concurrency=4,
+        max_concurrency=16,
+        expected_source_bucket_owner="123456789012",
+    ),
+    create_args={"ExpectedBucketOwner": "123456789012"},
+)
+```
+
+This path supports uncompressed UTF-8 JSON Lines and text only. It writes to a
+random staging prefix, orders Spark `part-*` files by partition and chunk number,
+verifies the completed destination, and then deletes only that run's staging
+objects. Set `cleanup_staging=False` to retain them. A failed write or compose
+keeps staging for diagnosis and retry; a cleanup failure is reported in result
+metadata without hiding a successfully committed destination.
+
+Spark DataFrames have no implicit global row order. Dude preserves Spark's
+partition/chunk order but does not invent a row-order guarantee. Each nonfinal
+payload object must meet S3's 5 MiB multipart minimum; if skew creates a smaller
+object, Dude fails closed and retains the staging run. `mode="errorifexists"`
+performs a destination preflight check, but S3 clients without conditional
+multipart completion cannot make that check atomic against another writer.
+
 ## Send one file
 
 ```python
@@ -167,6 +202,15 @@ permissions (`s3:PutObject`, `s3:ListMultipartUploadParts`, and
 `s3:AbortMultipartUpload`). KMS-encrypted sources and destinations also require
 the corresponding KMS permissions. Configure an S3 lifecycle rule to expire
 abandoned multipart uploads as a final safety net.
+
+The high-level DataFrame single-object path additionally needs `s3:ListBucket`
+on its staging prefix and `s3:DeleteObject` when automatic staging cleanup is
+enabled. It never deletes user-supplied composition sources.
+
+Spark and the boto3 control-plane client must both be authorized for the staging
+location. A Unity Catalog external location can authorize the Spark write without
+automatically supplying credentials to an arbitrary boto3 client; use an approved
+compute role or pass a configured S3 client when those trust paths differ.
 
 ### CLI
 

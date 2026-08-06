@@ -23,6 +23,12 @@ The baseline deliberately uses local disk and is capped at 20 GiB unless
 `--max-local-size` is explicitly raised. This harness measures the staging-to-one-
 object wedge; it does not imply that Parquet shards can be concatenated.
 
+`databricks_single_jsonl.py` is the direct benchmark for Dude's high-level
+DataFrame path. It alternates an intentionally serialized `coalesce(1)` JSON
+Lines write with parallel executor staging plus S3-side composition. Upload it
+as a Databricks notebook, configure an authorized synthetic source and unique
+benchmark prefix, and publish the complete JSON report rather than a screenshot.
+
 Record these dimensions with every result:
 
 - Databricks runtime, access mode, worker and driver types, and worker count.
