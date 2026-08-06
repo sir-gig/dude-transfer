@@ -29,6 +29,8 @@ All notable changes will be documented here.
 - Ambiguous-response recovery for single-request `PutObject` uploads.
 - Restart recovery when S3 committed an object before the process could remove
   its multipart checkpoint.
+- Full-commit pinning for GitHub Actions and Sigstore-backed build provenance for
+  tagged release artifacts.
 
 ### Changed
 
