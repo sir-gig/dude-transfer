@@ -8,6 +8,7 @@ import sys
 import time
 from typing import Any
 
+from .models import TransferEvent
 from .s3 import MultipartConfig, plan_file, send_file
 from .utils import format_size
 
@@ -26,16 +27,28 @@ def _parser() -> argparse.ArgumentParser:
     send.add_argument("destination")
     _add_transfer_options(send)
     send.add_argument("--json", action="store_true", help="print the result as JSON")
+    send.add_argument(
+        "--json-events",
+        action="store_true",
+        help="stream structured transfer events to stderr",
+    )
+    send.add_argument("--expected-bucket-owner", help="reject a bucket owned by another account")
+    send.add_argument("--sse-kms-key-id", help="encrypt the object with this KMS key")
     return parser
 
 
 def _add_transfer_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--part-size", default="64MiB")
     parser.add_argument("--concurrency", type=int, default=8)
+    parser.add_argument("--initial-concurrency", type=int, default=2)
+    parser.add_argument("--fixed-concurrency", action="store_true")
+    parser.add_argument("--adjustment-window", type=int, default=2)
     parser.add_argument("--max-memory", default="512MiB")
     parser.add_argument("--threshold", default="100MiB")
     parser.add_argument("--checksum", choices=("CRC32", "SHA256", "none"), default="CRC32")
     parser.add_argument("--no-resume", action="store_true")
+    parser.add_argument("--checkpoint")
+    parser.add_argument("--verify", action="store_true")
 
 
 def _config(args: argparse.Namespace) -> MultipartConfig:
@@ -43,9 +56,14 @@ def _config(args: argparse.Namespace) -> MultipartConfig:
         multipart_threshold=args.threshold,
         part_size=args.part_size,
         max_concurrency=args.concurrency,
+        initial_concurrency=args.initial_concurrency,
+        adaptive=not args.fixed_concurrency,
+        adjustment_window=args.adjustment_window,
         max_in_flight_bytes=args.max_memory,
         checksum_algorithm=None if args.checksum == "none" else args.checksum,
         resume=not args.no_resume,
+        checkpoint_path=args.checkpoint,
+        verify_after_upload=args.verify,
     )
 
 
@@ -55,7 +73,10 @@ def _print_plan(plan: Any) -> None:
     print(f"size:         {format_size(plan.size_bytes)}")
     print(f"mode:         {'multipart' if plan.multipart else 'single request'}")
     print(f"parts:        {plan.part_count} x up to {format_size(plan.part_size)}")
-    print(f"concurrency:  {plan.concurrency}")
+    if plan.adaptive:
+        print(f"concurrency:  adaptive {plan.initial_concurrency}..{plan.concurrency}")
+    else:
+        print(f"concurrency:  fixed {plan.concurrency}")
     print(f"peak buffers: {format_size(plan.peak_buffer_bytes)}")
 
 
@@ -82,11 +103,32 @@ def main(argv: list[str] | None = None) -> int:
             flush=True,
         )
 
+    def event(item: TransferEvent) -> None:
+        if args.json_events:
+            print(json.dumps(item.as_dict(), sort_keys=True), file=sys.stderr, flush=True)
+        elif item.phase == "concurrency_changed":
+            print(
+                f"\nDude tuned concurrency to {item.concurrency} ({item.detail})",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    create_args = {}
+    if args.expected_bucket_owner:
+        create_args["ExpectedBucketOwner"] = args.expected_bucket_owner
+    if args.sse_kms_key_id:
+        create_args.update(
+            ServerSideEncryption="aws:kms",
+            SSEKMSKeyId=args.sse_kms_key_id,
+        )
+
     result = send_file(
         args.source,
         args.destination,
         config=config,
-        progress=None if args.json else progress,
+        create_args=create_args,
+        progress=None if args.json or args.json_events else progress,
+        events=event,
     )
     if not args.json:
         print(file=sys.stderr)

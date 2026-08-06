@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 
+from dude_transfer import CheckpointError, ConfigurationError, SourceChangedError
 from dude_transfer.s3 import MultipartConfig, parse_s3_uri, plan_file, send_file
 
 
@@ -11,9 +12,14 @@ class FakeS3:
         self.completed = None
         self.put = None
         self.aborted = None
+        self.object_size = None
+        self.object_metadata = None
 
     def put_object(self, **kwargs):
-        self.put = kwargs
+        payload = kwargs["Body"].read()
+        self.put = {**kwargs, "Body": payload}
+        self.object_size = len(payload)
+        self.object_metadata = kwargs.get("Metadata", {})
         return {"ETag": '"small"'}
 
     def create_multipart_upload(self, **kwargs):
@@ -24,6 +30,7 @@ class FakeS3:
         parts = []
         for number, upload in sorted(self.uploaded.items()):
             part = {"PartNumber": number, "ETag": f'"part-{number}"'}
+            part["Size"] = len(upload["Body"])
             if upload.get("ChecksumCRC32"):
                 part["ChecksumCRC32"] = upload["ChecksumCRC32"]
             parts.append(part)
@@ -36,10 +43,15 @@ class FakeS3:
 
     def complete_multipart_upload(self, **kwargs):
         self.completed = kwargs
+        self.object_size = sum(len(upload["Body"]) for upload in self.uploaded.values())
+        self.object_metadata = self.create_args.get("Metadata", {})
         return {"ETag": '"complete"'}
 
     def abort_multipart_upload(self, **kwargs):
         self.aborted = kwargs
+
+    def head_object(self, **kwargs):
+        return {"ContentLength": self.object_size, "Metadata": self.object_metadata}
 
 
 class FailingS3(FakeS3):
@@ -57,6 +69,44 @@ class FailingOnceS3(FakeS3):
             self.should_fail = False
             raise RuntimeError("temporary outage")
         return super().upload_part(**kwargs)
+
+
+class CompletionLostS3(FakeS3):
+    def complete_multipart_upload(self, **kwargs):
+        super().complete_multipart_upload(**kwargs)
+        raise RuntimeError("response lost")
+
+
+class MutatingS3(FakeS3):
+    def __init__(self, source):
+        super().__init__()
+        self.source = source
+        self.mutated = False
+
+    def upload_part(self, **kwargs):
+        response = super().upload_part(**kwargs)
+        if not self.mutated:
+            with self.source.open("ab") as stream:
+                stream.write(b"changed")
+            self.mutated = True
+        return response
+
+
+class AccessDeniedError(Exception):
+    response = {
+        "Error": {"Code": "AccessDenied"},
+        "ResponseMetadata": {"HTTPStatusCode": 403},
+    }
+
+
+class AccessDeniedS3(FakeS3):
+    def __init__(self):
+        super().__init__()
+        self.attempts = 0
+
+    def upload_part(self, **kwargs):
+        self.attempts += 1
+        raise AccessDeniedError("denied")
 
 
 def make_sparse_file(path: Path, size: int) -> Path:
@@ -82,6 +132,8 @@ def test_plan_bounds_concurrency_by_memory(tmp_path):
     plan = plan_file(source, "s3://bucket/key", config=config)
     assert plan.part_count == 5
     assert plan.concurrency == 2
+    assert plan.initial_concurrency == 2
+    assert plan.adaptive is False
 
 
 def test_multipart_upload_completes_and_removes_checkpoint(tmp_path):
@@ -151,4 +203,86 @@ def test_failed_upload_resumes_remote_parts(tmp_path):
     result = send_file(source, "s3://bucket/key", config=config, client=client)
     assert result.resumed is True
     assert result.parts == 3
+    assert result.metadata["reused_parts"] == 1
     assert not checkpoint.exists()
+
+
+def test_reserved_create_args_are_rejected(tmp_path):
+    source = tmp_path / "small.txt"
+    source.write_text("hello", encoding="utf-8")
+    with pytest.raises(ConfigurationError, match="Dude-managed"):
+        send_file(
+            source,
+            "s3://bucket/key",
+            client=FakeS3(),
+            create_args={"Bucket": "other"},
+        )
+
+
+def test_corrupt_checkpoint_is_not_silently_discarded(tmp_path):
+    source = make_sparse_file(tmp_path / "large.bin", 6 * 1024**2)
+    checkpoint = tmp_path / "checkpoint.json"
+    checkpoint.write_text("not json", encoding="utf-8")
+    config = MultipartConfig(
+        multipart_threshold=1,
+        part_size="5MiB",
+        checkpoint_path=checkpoint,
+    )
+    with pytest.raises(CheckpointError, match="corrupt"):
+        send_file(source, "s3://bucket/key", config=config, client=FakeS3())
+
+
+def test_completion_response_loss_is_recovered_by_transfer_identity(tmp_path):
+    source = make_sparse_file(tmp_path / "large.bin", 6 * 1024**2)
+    config = MultipartConfig(
+        multipart_threshold=1,
+        part_size="5MiB",
+        max_attempts=1,
+        verify_after_upload=True,
+    )
+    result = send_file(source, "s3://bucket/key", config=config, client=CompletionLostS3())
+    assert result.metadata["completion_recovered"] is True
+    assert result.metadata["verified"] is True
+
+
+def test_source_mutation_aborts_uncommitted_upload(tmp_path):
+    source = make_sparse_file(tmp_path / "large.bin", 6 * 1024**2)
+    checkpoint = tmp_path / "checkpoint.json"
+    config = MultipartConfig(
+        multipart_threshold=1,
+        part_size="5MiB",
+        checkpoint_path=checkpoint,
+    )
+    client = MutatingS3(source)
+    with pytest.raises(SourceChangedError):
+        send_file(source, "s3://bucket/key", config=config, client=client)
+    assert client.aborted["UploadId"] == "upload-1"
+    assert not checkpoint.exists()
+
+
+def test_access_denied_is_not_retried(tmp_path):
+    source = make_sparse_file(tmp_path / "large.bin", 5 * 1024**2)
+    config = MultipartConfig(
+        multipart_threshold=1,
+        part_size="5MiB",
+        max_attempts=4,
+        resume=False,
+    )
+    client = AccessDeniedS3()
+    with pytest.raises(AccessDeniedError):
+        send_file(source, "s3://bucket/key", config=config, client=client)
+    assert client.attempts == 1
+
+
+def test_transfer_metadata_is_injected_without_overwriting_user_metadata(tmp_path):
+    source = tmp_path / "small.txt"
+    source.write_text("hello", encoding="utf-8")
+    client = FakeS3()
+    result = send_file(
+        source,
+        "s3://bucket/key",
+        client=client,
+        create_args={"Metadata": {"dataset": "diagnostics"}},
+    )
+    assert client.object_metadata["dataset"] == "diagnostics"
+    assert client.object_metadata["dude-transfer-id"] == result.metadata["transfer_id"]

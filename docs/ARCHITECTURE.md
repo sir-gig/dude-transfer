@@ -23,13 +23,23 @@ local or Volume file
       │
       ├─ plan part size, count, concurrency, and buffer ceiling
       ├─ reconcile checkpoint with S3 ListParts
-      ├─ upload missing checksummed parts concurrently
+      ├─ upload missing checksummed parts with adaptive concurrency
       └─ atomically CompleteMultipartUpload
 ```
 
 Each worker holds at most one part in memory. The configured in-flight byte
 ceiling limits effective concurrency. Failed resumable transfers retain their
 remote parts and checkpoint. Non-resumable failures abort the remote upload.
+
+The adaptive controller begins conservatively, probes upward when aggregate
+throughput improves, and applies multiplicative backoff when a part requires a
+retry. Concurrency never exceeds the configured byte ceiling. Every adjustment
+is returned as structured result metadata and can be streamed as a `TransferEvent`.
+
+Each newly created object carries a random `dude-transfer-id` metadata value.
+That identity lets Dude distinguish a successfully committed object from an old
+same-sized object if the completion response is lost. Remote parts are reusable
+only when their byte length and configured checksum metadata match the plan.
 
 ## Trust boundaries
 

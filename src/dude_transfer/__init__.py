@@ -2,15 +2,28 @@
 
 from .api import send
 from .dataframe import diagnose_dataframe, plan_dataframe, send_dataframe
-from .models import DataFramePlan, Diagnostic, FilePlan, TransferResult
+from .exceptions import (
+    CheckpointError,
+    ConfigurationError,
+    DudeError,
+    SourceChangedError,
+    UploadVerificationError,
+)
+from .models import DataFramePlan, Diagnostic, FilePlan, TransferEvent, TransferResult
 from .s3 import MultipartConfig, plan_file, send_file
 
 __all__ = [
     "DataFramePlan",
     "Diagnostic",
+    "DudeError",
+    "CheckpointError",
+    "ConfigurationError",
     "FilePlan",
     "MultipartConfig",
+    "SourceChangedError",
+    "TransferEvent",
     "TransferResult",
+    "UploadVerificationError",
     "diagnose_dataframe",
     "plan_dataframe",
     "plan_file",

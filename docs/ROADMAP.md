@@ -9,7 +9,7 @@
 ## Make tuning adaptive
 
 - Estimate compressed output size from a bounded sample.
-- Adjust concurrency from observed throughput, throttling, CPU, and memory.
+- Extend the initial throughput/retry controller with throttling, CPU, and NIC signals.
 - Learn safe defaults per cluster and bucket without retaining payload data.
 - Report the limiting stage with evidence from Spark and S3 telemetry.
 
