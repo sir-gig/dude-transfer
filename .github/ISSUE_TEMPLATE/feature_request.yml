@@ -1,0 +1,25 @@
+name: Feature request
+description: Propose an improvement or new transfer path
+title: "[feature]: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Transfer problem
+      description: Describe the workload and limitation without sensitive data.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+    validations:
+      required: true
+  - type: textarea
+    id: benchmark
+    attributes:
+      label: Success measure
+      description: What reproducible result would show that this works?
+    validations:
+      required: true
